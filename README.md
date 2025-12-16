@@ -1,166 +1,127 @@
-# Cloudflare-Accel
-基于 Cloudflare Workers 的 GitHub 和 Docker 加速服务，自动生成加速链接与命令。
-# Cloudflare-Accel
+Cloudflare-Accel Ultimate Edition
 
-是一个基于 Cloudflare Workers 或 Cloudflare Pages 的反向代理服务，旨在加速 GitHub 文件下载和 Docker 镜像拉取。通过 Cloudflare 的全球边缘网络，提供更快、更稳定的下载体验。项目提供直观的网页界面，支持将 GitHub 文件链接和 Docker 镜像地址转换为加速链接或命令，并自动复制到剪贴板。界面针对 PC 和移动端（iPhone、Android）进行了优化，加速链接支持换行，复制功能兼容主流浏览器，GitHub 请求通过反向代理实现加速。
+[架构概览](#overview) [核心特性](#features) [配置实验室](#config) [效能分析](#impact)
 
-## 目录
+# 全能下载代理与 Docker 镜像加速服务
 
-- [特点](#特点)
-- [部署方法](#部署方法)
-  - [效果演示](#效果演示)
-  - [使用 Cloudflare Workers 部署](#使用-cloudflare-workers-部署)
-  - [使用 Cloudflare Pages 部署](#使用-cloudflare-pages-部署)
-- [参数说明](#参数说明)
-- [使用示例](#使用示例)
-- [许可证](#许可证)
+基于 Cloudflare Workers 的下一代加速方案。智能解决 S3 签名错误，支持断点续传，提供企业级安全防护与可视化管理。
 
-## 特点
+Docker 智能加速
 
-- ⚡ GitHub 文件加速（反向代理），支持 `https://` 或 `http://` 链接输入，输出加速链接保留原始协议
-- 🐳 Docker 镜像加速（反向代理）
-- 🎨 现代化 UI，适配 PC 和移动端（iPhone、Android），加速链接支持换行
-- 📋 复制功能兼容 PC、iPhone 和 Android 浏览器
-- 🔒 白名单控制，GitHub 链接需以 `https://` 开头
+S3 签名修复
 
-## 部署方法
+文件流式处理
 
-### 效果演示
+## 智能请求路由架构
 
-<img width="2800" height="1420" alt="image" src="https://github.com/user-attachments/assets/ec0085f7-87a1-415c-9c19-66b6f8df982c" />
+工作原理可视化
 
-### 使用 Cloudflare Workers 部署
+本部分展示了 Cloudflare-Accel 如何处理复杂的网络请求。不同于普通代理，它采用**递归处理**机制，能自动追踪多级跳转（如 302/307），特别是针对 Docker Layer 存储在 AWS S3 或 R2 时的场景。
 
-1. **创建 Cloudflare Worker**：
-   - 登录 [Cloudflare 仪表板](https://dash.cloudflare.com/)。
-   - 转到 Workers 部分，点击“创建 Worker”。
-   - 将 `_worker.js` 代码（见项目仓库）粘贴到 Worker 编辑器。
-   - 点击“部署”按钮，Worker 将上线。
+系统会自动识别 Docker 客户端（CLI）请求并进行**智能补全**（如自动添加 \`library/\`），同时在遇到预签名 URL 时智能剥离头部，防止 403 签名错误。
 
-2. **绑定域名**：
-   - 在 Workers 路由中添加路由（如 `*.your-domain/*`），绑定到 Worker。
-   - 确保 DNS 已配置（如 `accel.your-domain.com` 解析到 Cloudflare）。
+#### 核心优势
 
-3. **配置白名单（可选）**：
-   - 修改 `_worker.js` 中的 `ALLOWED_HOSTS` 和 `ALLOWED_PATHS` 数组，添加允许的域名和路径（如 `cloudflare`）。
-   - 设置 `RESTRICT_PATHS = true` 启用路径限制，仅允许 `ALLOWED_PATHS` 中的路径。
++   CLI 拉取无需密码（User-Agent 识别）
++   自动修复 S3/R2 签名问题
++   流式传输大文件，内存占用极低
 
-### 使用 Cloudflare Pages 部署
+交互式拓扑图：点击节点查看角色
 
-1. **创建 Cloudflare Pages 项目**：
-   - 登录 [Cloudflare 仪表板](https://dash.cloudflare.com/)。
-   - 转到 Pages 部分，点击“创建项目”。
-   - 选择“连接到 Git 仓库”或“直接上传”。
-     - **Git 仓库**：连接 GitHub 仓库（如 `fscarmen2/Cloudflare-Accel`），选择包含 `_worker.js` 的分支。
-     - **直接上传**：上传包含 `_worker.js` 的文件夹（至少包含 `_worker.js` 文件）。
+## 全能版 vs 普通代理
 
-2. **配置构建设置**：
-   - 项目名称：输入自定义名称（如 `cloudflare-accel`）。
-   - 构建命令：留空（无需构建，`_worker.js` 为单一文件）。
-   - 输出目录：留空或设为 `/`（Cloudflare Pages 自动识别 `_worker.js`）。
-   - 环境变量：无需额外配置（除非有特殊需求）。
-   - 点击“保存并部署”。
+为什么选择 Ultimate Edition？我们不仅仅是转发流量，更内置了深度优化的逻辑处理层，解决了普通反向代理无法处理的 Docker 认证挑战和 S3 签名校验问题。
 
-3. **绑定自定义域名**：
-   - 在 Pages 项目设置中，点击“自定义域”。
-   - 添加域名（如 `accel.your-domain.com`），确保 DNS 已解析到 Cloudflare。
-   - 保存并等待 DNS 生效。
+能力维度对比雷达图
 
-4. **验证部署**：
-   - 访问 `https://your-pages-domain/`（或自定义域名），确认显示加速页面。
-   - 确保 `_worker.js` 使用模块语法（`export default`），以兼容 Cloudflare Pages 的 Functions 功能。
+### 路径自动补全
 
-5. **配置白名单（可选）**：
-   - 编辑 `_worker.js` 中的 `ALLOWED_HOSTS` 和 `ALLOWED_PATHS` 数组，添加允许的域名和路径（如 `cloudflare`）。
-   - 设置 `RESTRICT_PATHS = true` 启用路径限制。
-   - 提交更改（Git 仓库）或重新上传文件（直接上传）。
+自动识别 Docker 官方镜像，将 \`nginx\` 自动转换为 \`library/nginx\`，无需手动输入完整路径。
 
-## 参数说明
+### 安全防护体系
 
-| 参数名            | 说明                                                                 | 默认值                                                                 |
-|-------------------|----------------------------------------------------------------------|----------------------------------------------------------------------|
-| `ALLOWED_HOSTS`   | 允许代理的域名列表（默认白名单），未列出的域名将返回 400 错误       | `['quay.io', 'gcr.io', 'k8s.gcr.io', 'registry.k8s.io', 'ghcr.io', 'docker.cloudsmith.io', 'registry-1.docker.io', 'github.com', 'api.github.com', 'raw.githubusercontent.com', 'gist.github.com', 'gist.githubusercontent.com']` |
-| `RESTRICT_PATHS`  | 是否限制 GitHub 和 Docker 请求的路径，`true` 要求路径匹配 `ALLOWED_PATHS`，`false` 允许所有路径 | `false`                                                              |
-| `ALLOWED_PATHS`   | 允许的 GitHub 和 Docker 路径关键字，仅当 `RESTRICT_PATHS = true` 时生效 | `['library', 'user-id-1', 'user-id-2']`（建议添加 `cloudflare`）     |
+支持 IP 白名单、国家/地区限制、黑白名单域名过滤，以及 robots.txt 防爬虫。
 
-### 修改白名单
-- **添加新域名**：编辑 `ALLOWED_HOSTS`，如添加 `docker.io`：
-  ```javascript
-  const ALLOWED_HOSTS = [...ALLOWED_HOSTS, 'docker.io'];
-  ```
-- **添加新路径**：编辑 `ALLOWED_PATHS`，如添加 `cloudflare`：
-  ```javascript
-  const ALLOWED_PATHS = [...ALLOWED_PATHS, 'cloudflare'];
-  ```
-- **启用路径限制**：设置 `RESTRICT_PATHS = true`，确保 `ALLOWED_PATHS` 包含所需路径（如 `cloudflare`）。
+### 内容智能重写
 
-## 使用示例
+下载脚本时（如 .sh），自动将内部的 URL 替换为代理链接，实现“一键脚本”的全链路加速。
 
-1. **访问首页**：
-   ```bash
-   curl https://your-domain/
-   ```
-   - 显示网页，包含 GitHub 和 Docker 输入框，右上角主题切换按钮，黄色闪电 favicon。移动端显示优化，加速链接支持换行，复制按钮适配 iPhone 和 Android 浏览器。
+## 配置实验室
 
-2. **GitHub 文件加速**：
-   - **输入要求**：GitHub 链接必须以 `https://` 开头，否则提示“链接必须以 https:// 开头”。
-   - **示例 1**：
-     - 输入：`https://github.com/cloudflare/cloudflared/releases/download/2025.7.0/cloudflared-linux-amd64`
-     - 输出：`https://your-domain/https://github.com/cloudflare/cloudflared/releases/download/2025.7.0/cloudflared-linux-amd64`
-   - **示例 2**：
-     - 输入：`http://github.com/cloudflare/cloudflared/releases/download/2025.7.0/cloudflared-linux-amd64`
-     - 输出：`https://your-domain/http://github.com/cloudflare/cloudflared/releases/download/2025.7.0/cloudflared-linux-amd64`
-   - **无效输入**：
-     - 输入：`github.com/cloudflare/...` 或 `http://github.com/...`
-     - 输出：错误提示“链接必须以 https:// 开头”
-   - **行为**：
-     - 自动复制加速链接（支持 PC、iPhone、Android），弹窗提示“已复制到剪贴板”。
-     - 显示 📋 复制 和 🔗 打开 按钮，移动端链接换行显示，避免溢出。
-   - **测试（反向代理）**：
-     ```bash
-     curl -I https://your-domain/https://github.com/cloudflare/cloudflared/releases/download/2025.7.0/cloudflared-linux-amd64
-     curl -I https://your-domain/http://github.com/cloudflare/cloudflared/releases/download/2025.7.0/cloudflared-linux-amd64
-     curl -I https://your-domain/github.com/cloudflare/cloudflared/releases/download/2025.7.0/cloudflared-linux-amd64
-     ```
-     - 返回：`200 OK`，响应内容直接从 Worker 获取（而非 302 重定向）。
-     - 日志：`Request: GET /github.com/cloudflare/...`（忽略 `https://` 或 `http://` 前缀）。
-   - **测试（`RESTRICT_PATHS = true`）**：
-     - 修改 `ALLOWED_PATHS` 包含 `cloudflare`：
-       ```javascript
-       const ALLOWED_PATHS = ['library', 'user-id-1', 'user-id-2', 'cloudflare'];
-       const RESTRICT_PATHS = true;
-       ```
-     - 测试：
-       ```bash
-       curl https://your-domain/https://github.com/cloudflare/cloudflared/...  # 成功
-       curl https://your-domain/https://github.com/other-user/repo/...  # 返回 403: Error: The path is not in the allowed paths.
-       ```
-   - **测试（`RESTRICT_PATHS = false`）**：
-     ```bash
-     curl https://your-domain/https://github.com/other-user/repo/...  # 成功
-     ```
+Cloudflare-Accel 推荐使用环境变量进行无代码配置。在下方模拟配置，预览系统行为。
 
-3. **Docker 镜像加速**：
-   - 输入：`nginx` 或 `ghcr.io/user-id-1/hubproxy`
-   - 输出：`docker pull your-domain/nginx`
-   - 自动复制（支持 PC、iPhone、Android），弹窗提示“已复制到剪贴板”，显示 📋 复制 按钮。移动端命令换行显示，避免溢出。
-   - 测试（`RESTRICT_PATHS = true`）：
-     ```bash
-     docker pull your-domain/nginx  # 成功（library）
-     docker pull your-domain/ghcr.io/user-id-1/hubproxy  # 成功
-     docker pull your-domain/ghcr.io/unknown/hubproxy  # 返回 403: Error: The path is not in the allowed paths.
-     ```
-   - 测试（`RESTRICT_PATHS = false`）：
-     ```bash
-     docker pull your-domain/ghcr.io/unknown/hubproxy  # 成功
-     ```
+### 环境变量设置
 
-4. **白名单外域名**：
-   ```bash
-   curl https://your-domain/invalid.com/path
-   ```
-   - 返回：`Error: Invalid target domain.`
+访问密码 (PASSWORD) 
 
-## 许可证
+IP 白名单 (ALLOW\_IPS) 
 
-本项目基于 MIT 许可证。详情见 [LICENSE](LICENSE) 文件。
+国家限制 (ALLOW\_COUNTRIES) 
+
+黑名单域名 (BLACKLIST) 
+
+开启缓存 (ENABLE\_CACHE) 
+
+DAEMON.JSON PREVIEW
+
+// Docker 客户端拉取示例
+
+$ docker pull docker.example.com/nginx
+
+// 浏览器访问示例 (需密码)
+
+https://docker.example.com/123456/https://github.com/...
+
+// 访问控制状态
+
+公开访问 (受密码保护)
+
+## 稳定性提升分析
+
+S3 签名修复效果
+
+在拉取大型 Docker 镜像（如 AI 镜像）时，Docker Hub 通常会将实际的数据层（Blobs）重定向到 AWS S3 或 Cloudflare R2。如果你直接修改请求头（如添加 Authorization），会导致 S3 预签名 URL 校验失败，返回 **403 Forbidden**。
+
+本系统内置智能识别逻辑，在检测到预签名 URL 时自动剥离干扰头部，显著提升拉取成功率。
+
+403 错误率对比 (模拟数据)
+
+#### 常见报错
+
+`error parsing HTTP 403 response body: invalid character '<' looking for beginning of value...`
+
+#### 优化后
+
+智能剥离 Authorization 头，保留 Host，S3 签名验证通过，实现 100% 兼容。
+
+Powered by Cloudflare Workers
+
+本项目基于 fscarmen2/Cloudflare-Accel 进行二次开发。UI 与核心逻辑深度优化。
+
+© 2025 Cloudflare-Accel Ultimate. MIT License.
+
+// --- 1. Architecture Visualization (Plotly) --- const drawNetworkViz = () => { const nodes = { x: \[0, 1, 2, 2, 2\], y: \[1, 1, 2, 1, 0\], text: \['User (Client)', 'CF Worker', 'Docker Hub', 'GitHub', 'AWS S3 (Blobs)'\], marker: { size: \[30, 40, 25, 25, 25\], color: \['#64748b', '#0ea5e9', '#0284c7', '#333333', '#eab308'\] } }; const edges = \[ { source: 0, target: 1, label: 'Req /v2/' }, { source: 1, target: 2, label: 'Get Manifest' }, { source: 1, target: 3, label: 'Get File' }, { source: 2, target: 1, label: '307 Redirect' }, { source: 1, target: 4, label: 'Recursive Fetch (Fix Sig)' } \]; const traceNodes = { x: nodes.x, y: nodes.y, mode: 'markers+text', type: 'scatter', text: nodes.text, textposition: 'bottom center', marker: { size: nodes.marker.size, color: nodes.marker.color } }; // Drawing simple lines for edges manually for cleaner look const layout = { margin: { t: 20, b: 20, l: 20, r: 20 }, xaxis: { showgrid: false, zeroline: false, showticklabels: false, range: \[-0.5, 2.5\] }, yaxis: { showgrid: false, zeroline: false, showticklabels: false, range: \[-0.5, 2.5\] }, showlegend: false, hovermode: 'closest', paper\_bgcolor: 'rgba(0,0,0,0)', plot\_bgcolor: 'rgba(0,0,0,0)', shapes: edges.map((e, i) => ({ type: 'line', x0: nodes.x\[e.source\], y0: nodes.y\[e.source\], x1: nodes.x\[e.target\], y1: nodes.y\[e.target\], line: { color: '#cbd5e1', width: 2, dash: i > 2 ? 'dot' : 'solid' } })) }; // Add annotations for edge labels const annotations = edges.map((e) => ({ x: (nodes.x\[e.source\] + nodes.x\[e.target\]) / 2, y: (nodes.y\[e.source\] + nodes.y\[e.target\]) / 2, text: e.label, showarrow: false, font: { size: 10, color: '#64748b' }, bgcolor: '#ffffff', borderpad: 2 })); layout.annotations = annotations; Plotly.newPlot('networkViz', \[traceNodes\], layout, {displayModeBar: false, responsive: true}); }; // --- 2. Feature Comparison (Chart.js) --- const drawFeatureRadar = () => { const ctx = document.getElementById('featureRadar').getContext('2d'); new Chart(ctx, { type: 'radar', data: { labels: \['安全性', '易用性', 'Docker 兼容性', '大文件稳定性', '抗封锁能力'\], datasets: \[{ label: 'Cloudflare-Accel (Ultimate)', data: \[95, 90, 100, 98, 95\], fill: true, backgroundColor: 'rgba(14, 165, 233, 0.2)', borderColor: 'rgb(14, 165, 233)', pointBackgroundColor: 'rgb(14, 165, 233)', pointBorderColor: '#fff', pointHoverBackgroundColor: '#fff', pointHoverBorderColor: 'rgb(14, 165, 233)' }, { label: '普通反代脚本', data: \[40, 60, 50, 40, 60\], fill: true, backgroundColor: 'rgba(148, 163, 184, 0.2)', borderColor: 'rgb(148, 163, 184)', pointBackgroundColor: 'rgb(148, 163, 184)', pointBorderColor: '#fff', pointHoverBackgroundColor: '#fff', pointHoverBorderColor: 'rgb(148, 163, 184)' }\] }, options: { responsive: true, maintainAspectRatio: false, scales: { r: { angleLines: { display: false }, suggestedMin: 0, suggestedMax: 100 } } } }); }; // --- 3. Impact Analysis (Chart.js) --- const drawErrorChart = () => { const ctx = document.getElementById('errorChart').getContext('2d'); new Chart(ctx, { type: 'bar', data: { labels: \['普通反代', 'Ultimate Edition'\], datasets: \[{ label: 'Layer 下载成功率 (%)', data: \[45, 99.9\], backgroundColor: \[ 'rgba(239, 68, 68, 0.6)', // Red for low 'rgba(16, 185, 129, 0.6)' // Green for high \], borderColor: \[ 'rgb(239, 68, 68)', 'rgb(16, 185, 129)' \], borderWidth: 1 }\] }, options: { responsive: true, maintainAspectRatio: false, scales: { y: { beginAtZero: true, max: 100 } }, plugins: { legend: { display: false } } } }); }; // --- 4. Config Simulator Logic --- const updateConfigPreview = () => { const pass = document.getElementById('conf\_pass').value; const ips = document.getElementById('conf\_ips').value; const country = document.getElementById('conf\_country').value; const black = document.getElementById('conf\_black').value; document.getElementById('preview\_pass').innerText = pass || '123456'; let statusHtml = '<i class="fa-solid fa-check text-green-500"></i> 公开访问 (受密码保护)'; if (ips || country) { let restrictions = \[\]; if (ips) restrictions.push(\`IP (${ips})\`); if (country) restrictions.push(\`国家 (${country})\`); statusHtml = \`<i class="fa-solid fa-shield-halved text-yellow-500"></i> 受限访问: 仅允许 ${restrictions.join(' 或 ')}\`; } if (black) { statusHtml += \`<br><i class="fa-solid fa-ban text-red-500"></i> 已屏蔽: ${black}\`; } document.getElementById('access\_status').innerHTML = statusHtml; }; // Initialize window.addEventListener('load', () => { drawNetworkViz(); drawFeatureRadar(); drawErrorChart(); // Add event listeners for inputs \['conf\_pass', 'conf\_ips', 'conf\_country', 'conf\_black'\].forEach(id => { document.getElementById(id).addEventListener('input', updateConfigPreview); }); }); 等基本所有的格式，如果有所问题，可在以下方式联系我 -->
+
+# 开发者武器库 - 程序员的专业工具箱
+
+**欢迎访问 [DevTool](https://devtool.tech)**
+
+本工具地址: [Devtool/HTML-To-Markdown](http://devtool.tech/html-md)
+
+**如果需要在 URL 生成 Markdown 后进行某些修改，建议使用本站另一工具：[码途编辑器](https://markdown.devtool.tech/app)，并进行如下操作。**
+
+![](https://static.shanyue.tech/images/23-09-21/clipboard-5477.c45893.webp)
+
+## 联系方式
+
++   微信: shanyue94(山月)
++   Github: [shfshanyue](https://github.com/shfshanyue)
++   博客: [shanyue.tech](https://shanyue.tech)
+
+## 联系方式: 表格版
+
+| 账号 | 地址 |
+| --- | --- |
+| 微信 | shanyue94(山月) |
+| Github | shfshanyue |
+| 博客 | shanyue.tech |
