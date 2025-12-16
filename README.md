@@ -1,166 +1,81 @@
-# Cloudflare-Accel
-基于 Cloudflare Workers 的 GitHub 和 Docker 加速服务，自动生成加速链接与命令。
-# Cloudflare-Accel
+# Cloudflare-Accel (Ultimate Edition)
 
-是一个基于 Cloudflare Workers 或 Cloudflare Pages 的反向代理服务，旨在加速 GitHub 文件下载和 Docker 镜像拉取。通过 Cloudflare 的全球边缘网络，提供更快、更稳定的下载体验。项目提供直观的网页界面，支持将 GitHub 文件链接和 Docker 镜像地址转换为加速链接或命令，并自动复制到剪贴板。界面针对 PC 和移动端（iPhone、Android）进行了优化，加速链接支持换行，复制功能兼容主流浏览器，GitHub 请求通过反向代理实现加速。
+基于 Cloudflare Workers 的全能下载代理与 Docker 镜像加速服务。
 
-## 目录
+这是一个集成了 **Docker 镜像智能加速**、**通用文件/网页代理**、**大文件流式处理** 以及 **安全防护** 于一体的终极解决方案。它解决了 Docker 拉取 AWS S3/Cloudflare R2 资源时的 403 签名错误，支持断点续传，并提供了直观的 Web 管理界面。
 
-- [特点](#特点)
-- [部署方法](#部署方法)
-  - [效果演示](#效果演示)
-  - [使用 Cloudflare Workers 部署](#使用-cloudflare-workers-部署)
-  - [使用 Cloudflare Pages 部署](#使用-cloudflare-pages-部署)
-- [参数说明](#参数说明)
-- [使用示例](#使用示例)
-- [许可证](#许可证)
+## 🚀 核心特点
 
-## 特点
+### 1. 🐳 Docker 镜像加速 (核心增强)
+- **智能路由**: 自动识别 Docker 客户端请求（User-Agent 检测），**CLI 拉取无需密码**。
+- **路径补全**: 自动为 Docker Hub 官方镜像补全 `library/` 前缀（如 `docker pull domain/nginx` 自动转换为 `library/nginx`）。
+- **S3 签名修复**: 智能识别并修复 Docker Layer 在重定向到 AWS S3/R2 时的签名问题，彻底解决 `403 Forbidden` 错误。
+- **递归处理**: 自动追踪多级 302/307 跳转，确保镜像拉取成功率。
+- **多仓库支持**: 完美支持 `docker.io`, `ghcr.io`, `quay.io`, `k8s.gcr.io` 等主流仓库。
 
-- ⚡ GitHub 文件加速（反向代理），支持 `https://` 或 `http://` 链接输入，输出加速链接保留原始协议
-- 🐳 Docker 镜像加速（反向代理）
-- 🎨 现代化 UI，适配 PC 和移动端（iPhone、Android），加速链接支持换行
-- 📋 复制功能兼容 PC、iPhone 和 Android 浏览器
-- 🔒 白名单控制，GitHub 链接需以 `https://` 开头
+### 2. ⚡ 通用文件/网页代理
+- **密码保护**: 普通文件下载或网页访问需通过 `/密码/` 路径验证，防止恶意盗用。
+- **流式处理**: 支持无限大小的大文件流式传输，内存占用极低。
+- **内容重写**:
+    - 自动替换 `.sh/.py` 脚本中的 URL 为代理链接。
+    - 自动重写网页 HTML 中的 `href`/`src` 链接。
+- **防盗链伪装**: 自动修改 Referer/Origin/User-Agent，绕过目标网站限制。
 
-## 部署方法
+### 3. 🛡️ 安全与隐私
+- **隐身模式**: 访问根目录或错误密码返回 404，只有知道密码才能看到管理面板。
+- **访问控制**: 支持 **IP 白名单** 和 **国家/地区限制**。
+- **黑白名单**: 可配置目标域名的黑名单或白名单。
+- **隐私保护**: 内置 `robots.txt` 禁止搜索引擎爬虫收录。
 
-### 效果演示
+### 4. 🎨 现代化 UI
+- **经典双栏设计**: 上方通用加速（带打开链接），下方 Docker 加速（带复制命令）。
+- **配置生成器**: UI 底部一键生成 `daemon.json` 配置内容。
+- **自动适配**: 支持深色/浅色模式切换。
 
-<img width="2800" height="1420" alt="image" src="https://github.com/user-attachments/assets/ec0085f7-87a1-415c-9c19-66b6f8df982c" />
+---
 
-### 使用 Cloudflare Workers 部署
+## 🛠️ 部署方法
 
-1. **创建 Cloudflare Worker**：
-   - 登录 [Cloudflare 仪表板](https://dash.cloudflare.com/)。
-   - 转到 Workers 部分，点击“创建 Worker”。
-   - 将 `_worker.js` 代码（见项目仓库）粘贴到 Worker 编辑器。
-   - 点击“部署”按钮，Worker 将上线。
+### 1. 部署代码
+1. 登录 [Cloudflare Dashboard](https://dash.cloudflare.com/)。
+2. 进入 **Workers & Pages** -> **Create Application** -> **Create Worker**。
+3. 命名你的 Worker（例如 `docker-accel`），点击 **Deploy**。
+4. 点击 **Edit code**，将本项目提供的 `worker.js` 代码全选粘贴覆盖，**Save and Deploy**。
 
-2. **绑定域名**：
-   - 在 Workers 路由中添加路由（如 `*.your-domain/*`），绑定到 Worker。
-   - 确保 DNS 已配置（如 `accel.your-domain.com` 解析到 Cloudflare）。
+### 2. 配置环境变量 (推荐)
+为了安全和灵活性，建议在 Cloudflare 后台设置配置，而不是修改代码。
+进入 Worker 的 **Settings** -> **Variables**，添加以下变量：
 
-3. **配置白名单（可选）**：
-   - 修改 `_worker.js` 中的 `ALLOWED_HOSTS` 和 `ALLOWED_PATHS` 数组，添加允许的域名和路径（如 `cloudflare`）。
-   - 设置 `RESTRICT_PATHS = true` 启用路径限制，仅允许 `ALLOWED_PATHS` 中的路径。
+| 变量名 | 说明 | 示例值 |
+| :--- | :--- | :--- |
+| `PASSWORD` | **[必填]** 访问密码 (用于 Web 界面和普通代理) | `123456` |
+| `ALLOW_IPS` | 允许访问的客户端 IP (逗号分隔，留空不限制) | `1.2.3.4, 223.5.5.5` |
+| `ALLOW_COUNTRIES` | 允许访问的国家代码 (逗号分隔，留空不限制) | `CN, US, HK` |
+| `BLACKLIST` | 目标域名黑名单 (禁止代理访问的域名) | `baidu.com, qq.com` |
+| `WHITELIST` | 目标域名白名单 (只允许代理访问的域名) | `github.com, raw.githubusercontent.com` |
+| `ENABLE_CACHE` | 是否开启 Cloudflare 缓存 (`true`/`false`) | `true` |
 
-### 使用 Cloudflare Pages 部署
+*(注：如果未设置环境变量，代码将使用文件顶部的 `DEFAULT_CONFIG` 默认值)*
 
-1. **创建 Cloudflare Pages 项目**：
-   - 登录 [Cloudflare 仪表板](https://dash.cloudflare.com/)。
-   - 转到 Pages 部分，点击“创建项目”。
-   - 选择“连接到 Git 仓库”或“直接上传”。
-     - **Git 仓库**：连接 GitHub 仓库（如 `fscarmen2/Cloudflare-Accel`），选择包含 `_worker.js` 的分支。
-     - **直接上传**：上传包含 `_worker.js` 的文件夹（至少包含 `_worker.js` 文件）。
+---
 
-2. **配置构建设置**：
-   - 项目名称：输入自定义名称（如 `cloudflare-accel`）。
-   - 构建命令：留空（无需构建，`_worker.js` 为单一文件）。
-   - 输出目录：留空或设为 `/`（Cloudflare Pages 自动识别 `_worker.js`）。
-   - 环境变量：无需额外配置（除非有特殊需求）。
-   - 点击“保存并部署”。
+## 💻 使用示例
 
-3. **绑定自定义域名**：
-   - 在 Pages 项目设置中，点击“自定义域”。
-   - 添加域名（如 `accel.your-domain.com`），确保 DNS 已解析到 Cloudflare。
-   - 保存并等待 DNS 生效。
+假设你的 Worker 域名为 `docker.example.com`，设置的密码为 `123456`。
 
-4. **验证部署**：
-   - 访问 `https://your-pages-domain/`（或自定义域名），确认显示加速页面。
-   - 确保 `_worker.js` 使用模块语法（`export default`），以兼容 Cloudflare Pages 的 Functions 功能。
+### 场景 1：Docker 镜像加速 (无需密码)
 
-5. **配置白名单（可选）**：
-   - 编辑 `_worker.js` 中的 `ALLOWED_HOSTS` 和 `ALLOWED_PATHS` 数组，添加允许的域名和路径（如 `cloudflare`）。
-   - 设置 `RESTRICT_PATHS = true` 启用路径限制。
-   - 提交更改（Git 仓库）或重新上传文件（直接上传）。
+Worker 会自动检测 Docker 客户端，直接使用即可。
 
-## 参数说明
+**直接拉取官方镜像 (自动补全 library):**
+```bash
+docker pull [docker.example.com/nginx](https://docker.example.com/nginx)
+docker pull [docker.example.com/mysql:8.0](https://docker.example.com/mysql:8.0)
+docker pull [docker.example.com/alpine](https://docker.example.com/alpine)
 
-| 参数名            | 说明                                                                 | 默认值                                                                 |
-|-------------------|----------------------------------------------------------------------|----------------------------------------------------------------------|
-| `ALLOWED_HOSTS`   | 允许代理的域名列表（默认白名单），未列出的域名将返回 400 错误       | `['quay.io', 'gcr.io', 'k8s.gcr.io', 'registry.k8s.io', 'ghcr.io', 'docker.cloudsmith.io', 'registry-1.docker.io', 'github.com', 'api.github.com', 'raw.githubusercontent.com', 'gist.github.com', 'gist.githubusercontent.com']` |
-| `RESTRICT_PATHS`  | 是否限制 GitHub 和 Docker 请求的路径，`true` 要求路径匹配 `ALLOWED_PATHS`，`false` 允许所有路径 | `false`                                                              |
-| `ALLOWED_PATHS`   | 允许的 GitHub 和 Docker 路径关键字，仅当 `RESTRICT_PATHS = true` 时生效 | `['library', 'user-id-1', 'user-id-2']`（建议添加 `cloudflare`）     |
+**拉取第三方镜像 (ghcr.io, quay.io 等):**
+# GitHub Container Registry
+docker pull [docker.example.com/ghcr.io/username/image:tag](https://docker.example.com/ghcr.io/username/image:tag)
 
-### 修改白名单
-- **添加新域名**：编辑 `ALLOWED_HOSTS`，如添加 `docker.io`：
-  ```javascript
-  const ALLOWED_HOSTS = [...ALLOWED_HOSTS, 'docker.io'];
-  ```
-- **添加新路径**：编辑 `ALLOWED_PATHS`，如添加 `cloudflare`：
-  ```javascript
-  const ALLOWED_PATHS = [...ALLOWED_PATHS, 'cloudflare'];
-  ```
-- **启用路径限制**：设置 `RESTRICT_PATHS = true`，确保 `ALLOWED_PATHS` 包含所需路径（如 `cloudflare`）。
-
-## 使用示例
-
-1. **访问首页**：
-   ```bash
-   curl https://your-domain/
-   ```
-   - 显示网页，包含 GitHub 和 Docker 输入框，右上角主题切换按钮，黄色闪电 favicon。移动端显示优化，加速链接支持换行，复制按钮适配 iPhone 和 Android 浏览器。
-
-2. **GitHub 文件加速**：
-   - **输入要求**：GitHub 链接必须以 `https://` 开头，否则提示“链接必须以 https:// 开头”。
-   - **示例 1**：
-     - 输入：`https://github.com/cloudflare/cloudflared/releases/download/2025.7.0/cloudflared-linux-amd64`
-     - 输出：`https://your-domain/https://github.com/cloudflare/cloudflared/releases/download/2025.7.0/cloudflared-linux-amd64`
-   - **示例 2**：
-     - 输入：`http://github.com/cloudflare/cloudflared/releases/download/2025.7.0/cloudflared-linux-amd64`
-     - 输出：`https://your-domain/http://github.com/cloudflare/cloudflared/releases/download/2025.7.0/cloudflared-linux-amd64`
-   - **无效输入**：
-     - 输入：`github.com/cloudflare/...` 或 `http://github.com/...`
-     - 输出：错误提示“链接必须以 https:// 开头”
-   - **行为**：
-     - 自动复制加速链接（支持 PC、iPhone、Android），弹窗提示“已复制到剪贴板”。
-     - 显示 📋 复制 和 🔗 打开 按钮，移动端链接换行显示，避免溢出。
-   - **测试（反向代理）**：
-     ```bash
-     curl -I https://your-domain/https://github.com/cloudflare/cloudflared/releases/download/2025.7.0/cloudflared-linux-amd64
-     curl -I https://your-domain/http://github.com/cloudflare/cloudflared/releases/download/2025.7.0/cloudflared-linux-amd64
-     curl -I https://your-domain/github.com/cloudflare/cloudflared/releases/download/2025.7.0/cloudflared-linux-amd64
-     ```
-     - 返回：`200 OK`，响应内容直接从 Worker 获取（而非 302 重定向）。
-     - 日志：`Request: GET /github.com/cloudflare/...`（忽略 `https://` 或 `http://` 前缀）。
-   - **测试（`RESTRICT_PATHS = true`）**：
-     - 修改 `ALLOWED_PATHS` 包含 `cloudflare`：
-       ```javascript
-       const ALLOWED_PATHS = ['library', 'user-id-1', 'user-id-2', 'cloudflare'];
-       const RESTRICT_PATHS = true;
-       ```
-     - 测试：
-       ```bash
-       curl https://your-domain/https://github.com/cloudflare/cloudflared/...  # 成功
-       curl https://your-domain/https://github.com/other-user/repo/...  # 返回 403: Error: The path is not in the allowed paths.
-       ```
-   - **测试（`RESTRICT_PATHS = false`）**：
-     ```bash
-     curl https://your-domain/https://github.com/other-user/repo/...  # 成功
-     ```
-
-3. **Docker 镜像加速**：
-   - 输入：`nginx` 或 `ghcr.io/user-id-1/hubproxy`
-   - 输出：`docker pull your-domain/nginx`
-   - 自动复制（支持 PC、iPhone、Android），弹窗提示“已复制到剪贴板”，显示 📋 复制 按钮。移动端命令换行显示，避免溢出。
-   - 测试（`RESTRICT_PATHS = true`）：
-     ```bash
-     docker pull your-domain/nginx  # 成功（library）
-     docker pull your-domain/ghcr.io/user-id-1/hubproxy  # 成功
-     docker pull your-domain/ghcr.io/unknown/hubproxy  # 返回 403: Error: The path is not in the allowed paths.
-     ```
-   - 测试（`RESTRICT_PATHS = false`）：
-     ```bash
-     docker pull your-domain/ghcr.io/unknown/hubproxy  # 成功
-     ```
-
-4. **白名单外域名**：
-   ```bash
-   curl https://your-domain/invalid.com/path
-   ```
-   - 返回：`Error: Invalid target domain.`
-
-## 许可证
-
-本项目基于 MIT 许可证。详情见 [LICENSE](LICENSE) 文件。
+# Google Container Registry
+docker pull [docker.example.com/gcr.io/google-samples/hello-app:1.0](https://docker.example.com/gcr.io/google-samples/hello-app:1.0)
