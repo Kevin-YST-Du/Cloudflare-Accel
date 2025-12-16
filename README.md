@@ -73,7 +73,7 @@ docker pull [docker.example.com/nginx](https://docker.example.com/nginx)
 docker pull [docker.example.com/mysql:8.0](https://docker.example.com/mysql:8.0)
 docker pull [docker.example.com/alpine](https://docker.example.com/alpine)
 
-**拉取第三方镜像 (ghcr.io, quay.io 等):**
+拉取第三方镜像 (ghcr.io, quay.io 等):
 # GitHub Container Registry
 docker pull [docker.example.com/ghcr.io/username/image:tag](https://docker.example.com/ghcr.io/username/image:tag)
 
