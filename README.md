@@ -67,7 +67,7 @@
 
 Worker 会自动检测 Docker 客户端，直接使用即可。
 
-**直接拉取官方镜像 (自动补全 library):**
+直接拉取官方镜像 (自动补全 library):
 ```bash
 docker pull [docker.example.com/nginx](https://docker.example.com/nginx)
 docker pull [docker.example.com/mysql:8.0](https://docker.example.com/mysql:8.0)
