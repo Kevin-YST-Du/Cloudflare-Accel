@@ -37,10 +37,10 @@
 ## 🛠️ 部署方法
 
 ### 1. 部署代码
-1. 登录 [Cloudflare Dashboard](https://dash.cloudflare.com/)。
-2. 进入 **Workers & Pages** -> **Create Application** -> **Create Worker**。
-3. 命名你的 Worker（例如 `docker-accel`），点击 **Deploy**。
-4. 点击 **Edit code**，将本项目提供的 `worker.js` 代码全选粘贴覆盖，**Save and Deploy**。
+#### 1. 登录 [Cloudflare Dashboard](https://dash.cloudflare.com/)。
+#### 2. 进入 **Workers & Pages** -> **Create Application** -> **Create Worker**。
+#### 3. 命名你的 Worker（例如 `docker-accel`），点击 **Deploy**。
+#### 4. 点击 **Edit code**，将本项目提供的 `worker.js` 代码全选粘贴覆盖，**Save and Deploy**。
 
 ### 2. 配置环境变量 (推荐)
 为了安全和灵活性，建议在 Cloudflare 后台设置配置，而不是修改代码。
@@ -61,21 +61,49 @@
 
 ## 💻 使用示例
 
-假设你的 Worker 域名为 `docker.example.com`，设置的密码为 `123456`。
+## 假设你的 Worker 域名为 `docker.example.com`，设置的密码为 `123456`。
 
 ### 场景 1：Docker 镜像加速 (无需密码)
 
-Worker 会自动检测 Docker 客户端，直接使用即可。
+#### Worker 会自动检测 Docker 客户端，直接使用即可。
 
-直接拉取官方镜像 (自动补全 library):
+#### 直接拉取官方镜像 (自动补全 library):
 ```bash
 docker pull [docker.example.com/nginx](https://docker.example.com/nginx)
 docker pull [docker.example.com/mysql:8.0](https://docker.example.com/mysql:8.0)
 docker pull [docker.example.com/alpine](https://docker.example.com/alpine)
-
+```
 拉取第三方镜像 (ghcr.io, quay.io 等):
+```bash
 # GitHub Container Registry
 docker pull [docker.example.com/ghcr.io/username/image:tag](https://docker.example.com/ghcr.io/username/image:tag)
 
 # Google Container Registry
 docker pull [docker.example.com/gcr.io/google-samples/hello-app:1.0](https://docker.example.com/gcr.io/google-samples/hello-app:1.0)
+```
+
+# ❓ 常见问题
+## Q: 为什么浏览器直接访问 /v2/ 路径返回 404？
+### A: 这是为了安全。脚本检测到非 Docker 客户端（如 Chrome）访问 Docker API 路径时，会故意返回 404 隐藏服务。
+
+## Q: 为什么拉取大镜像层时通过了，但速度不快？
+### A: Worker 对流式传输进行了优化，但速度仍受限于 Cloudflare 边缘节点到源站（如 Docker Hub）的连接质量。开启 ENABLE_CACHE 可以加速热门镜像的二次拉取。
+
+## Q: 出现 403 Forbidden 怎么回事？ 
+### 1.检查是否触发了 BLACKLIST 黑名单。
+
+### 2.检查你的 IP/国家是否在允许列表中。
+
+### 3.如果是 Docker 拉取，脚本已自动处理 S3 签名问题，请确保你的 Worker 域名没有被墙。
+
+# 许可证
+## 本项目基于 MIT 许可证开源。
+
+# 致谢与声明
+## 本项目基于 [fscarmen2/Cloudflare-Accel](https://github.com/fscarmen2/Cloudflare-Accel) 进行二次开发。
+
+### 借鉴了原作者的 HTML 界面样式。
+
+### 参考并改进了 Docker 镜像加速 的核心逻辑。
+
+### 在此对原作者表示感谢！
