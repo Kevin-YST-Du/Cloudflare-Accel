@@ -74,6 +74,8 @@ export default {
     const clientIP = request.headers.get("CF-Connecting-IP") || "0.0.0.0";
     const acceptHeader = (request.headers.get("Accept") || "").toLowerCase();
     const userAgent = (request.headers.get("User-Agent") || "").toLowerCase();
+    const isDockerClient = userAgent.includes("docker") || userAgent.includes("go-http");
+    const isDockerV2 = url.pathname.startsWith("/v2/");
 
     // --------------------------------------------------------------------------------
     // 0. 基础静态资源处理 (直接返回，不消耗额度)
@@ -120,15 +122,23 @@ export default {
     const isWhitelisted = CONFIG.IP_LIMIT_WHITELIST.includes(clientIP);
     let usage = await getIpUsage(clientIP, env, CONFIG);
 
-    // 条件 A: 是 HTML 网页请求 (浏览器访问或跳转)
-    const isHtmlRequest = acceptHeader.includes("text/html");
-    
-    // 条件 B: 是 Docker 的 Manifest 清单请求 (docker pull 的第一步)
-    // 注意：Docker 下载 Layer (blobs) 时不含 manifests 路径，因此不计费
-    const isDockerManifestRequest = url.pathname.includes("/manifests/") && (userAgent.includes("docker") || userAgent.includes("go-http"));
+    // [修复逻辑] 只有当 URL 长度超过 "/密码/" 时才算作代理请求，避免访问仪表盘扣费
+    // url.pathname 是 "/123456/"，长度是 8。只有后面有内容才计费。
+    const isHtmlRequest = acceptHeader.includes("text/html") && url.pathname.length > (CONFIG.PASSWORD.length + 2);
+      
+// [极致优化 - 1次计费] [精准计费逻辑]
+// [修正后逻辑] 
+// 1. 必须是 GET 请求 (排除 HEAD 探测)
+    // 2. 必须是 manifest 请求
+    // 3. URL 不包含 "sha256:" (排除 Docker 内部的架构哈希请求，只记录用户输入的 Tag)
+    const isDockerCharge = isDockerV2 
+        && isDockerClient 
+        && url.pathname.includes("/manifests/") 
+        && request.method === "GET"
+        && !url.pathname.includes("sha256:");
 
     // 如果命中计费条件 且 不在白名单中
-    if ((isHtmlRequest || isDockerManifestRequest) && !isWhitelisted) {
+    if ((isHtmlRequest || isDockerCharge) && !isWhitelisted) {
       if (usage.count >= CONFIG.DAILY_LIMIT_COUNT) {
         return new Response(`⚠️ 次数超限: IP ${clientIP} 今日已使用 ${usage.count}/${CONFIG.DAILY_LIMIT_COUNT}`, { status: 429 });
       }
@@ -140,7 +150,6 @@ export default {
     // --------------------------------------------------------------------------------
     // 3. Docker 路由分流
     // --------------------------------------------------------------------------------
-    const isDockerClient = userAgent.includes("docker") || userAgent.includes("go-http");
     
     // 如果是 V2 API 且是 Docker 客户端，走 Docker 专用处理逻辑
     if (url.pathname.startsWith("/v2/") && isDockerClient) {
@@ -638,16 +647,19 @@ function renderDashboard(hostname, password, ip, count, limit) {
     </div>
 
     <div class="section-box">
-      <h2 class="text-xl font-bold mb-4 flex items-center gap-2">🐳 Docker 镜像加速</h2>
-      <div class="flex flex-responsive gap-2">
-        <input id="docker-image" type="text" placeholder="如 nginx 或 library/redis" class="flex-grow p-3 rounded-xl outline-none text-sm dark:bg-gray-800 dark:text-white">
-        <button onclick="convertDockerImage()" class="bg-blue-500 text-white px-6 py-3 rounded-xl hover:bg-blue-600 transition font-bold text-sm whitespace-nowrap shadow-md">获取命令</button>
-      </div>
-      <p id="docker-result" class="mt-4 p-3 text-green-600 dark:text-green-400 bg-green-50 dark:bg-green-900/20 rounded-lg hidden font-mono text-xs break-all border border-green-200 dark:border-green-800"></p>
-      <div id="docker-buttons" class="flex gap-2 mt-4 hidden">
-        <button onclick="copyDockerCommand()" class="w-full bg-gray-100 dark:bg-gray-700 text-gray-700 dark:text-gray-200 py-2.5 rounded-lg hover:bg-gray-200 dark:hover:bg-gray-600 transition text-sm font-bold">📋 复制命令</button>
-      </div>
+    <h2 class="text-xl font-bold mb-4 flex items-center gap-2">🐳 Docker 镜像加速</h2>
+    <div class="flex flex-col md:flex-row gap-2">
+      <input id="docker-image" type="text" placeholder="如 nginx 或 library/redis" class="flex-grow p-3 rounded-xl outline-none text-sm dark:bg-gray-800 dark:text-white border border-gray-200 dark:border-gray-600">
+      <button onclick="convertDockerImage()" class="bg-blue-500 text-white px-6 py-3 rounded-xl hover:bg-blue-600 transition font-bold text-sm shadow-md">获取命令</button>
     </div>
+    
+    <p class="text-[12px] text-orange-500 mt-2 font-medium">💡 提示：因 Docker 协议机制，拉取一次镜像会计入 2 次使用次数。</p>
+
+    <p id="docker-result" class="mt-4 p-3 text-green-600 dark:text-green-400 bg-green-50 dark:bg-green-900/20 rounded-lg hidden font-mono text-xs break-all border border-green-200 dark:border-green-800"></p>
+    <div id="docker-buttons" class="flex gap-2 mt-4 hidden">
+      <button onclick="copyDockerCommand()" class="w-full bg-gray-100 dark:bg-gray-700 text-gray-700 dark:text-gray-200 py-2.5 rounded-lg hover:bg-gray-200 dark:hover:bg-gray-600 transition text-sm font-bold">📋 复制命令</button>
+    </div>
+  </div>
 
     <div class="section-box">
       <h3 class="text-lg font-bold mb-3 tracking-tight">🛠️ 镜像源设置</h3>
