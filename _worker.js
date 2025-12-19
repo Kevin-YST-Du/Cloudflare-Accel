@@ -4,11 +4,10 @@
  * -----------------------------------------------------------------------------------------
  *
  * 【版本说明】
- * 此版本为完整无删减版，包含了所有核心逻辑：
- * 1. Docker 镜像加速 (支持 Library 补全、递归 Token 认证、S3 签名修复)
- * 2. 通用网页代理 (支持流式传输、HTML/JS 动态重写)
- * 3. 统计与安全 (支持 IP 白名单、精准计费、防盗链)
- * 4. UI 界面 (75% 宽度优化、多行 JSON 格式化)
+ * 1. [CSS 优化] 样式表已展开为多行，方便阅读和修改。
+ * 2. [智能防抖] 10秒内同一IP请求同一镜像Tag只计费1次，解决 Docker 重复扣费问题。
+ * 3. [计费回滚] 请求失败自动退还额度。
+ * 4. [功能完整] 包含镜像加速、S3 修复、UI 界面、IP 限制等。
  *
  * -----------------------------------------------------------------------------------------
  */
@@ -30,7 +29,7 @@ const DEFAULT_CONFIG = {
   // IP 白名单列表 (支持多行书写，在此列表内的 IP 不消耗额度)
   IP_LIMIT_WHITELIST: `
   127.0.0.1,
-  192.168.1.1
+  192.178.1.2
   `, 
 };
 
@@ -117,95 +116,137 @@ export default {
     }
 
     // --------------------------------------------------------------------------------
-    // 2. 精准计费逻辑 (核心修改点)
+    // 2. 精准计费逻辑 + 智能防抖 (Smart Debounce)
     // --------------------------------------------------------------------------------
     const isWhitelisted = CONFIG.IP_LIMIT_WHITELIST.includes(clientIP);
     let usage = await getIpUsage(clientIP, env, CONFIG);
 
-    // [修复逻辑] 只有当 URL 长度超过 "/密码/" 时才算作代理请求，避免访问仪表盘扣费
-    // url.pathname 是 "/123456/"，长度是 8。只有后面有内容才计费。
     const isHtmlRequest = acceptHeader.includes("text/html") && url.pathname.length > (CONFIG.PASSWORD.length + 2);
-      
-// [极致优化 - 1次计费] [精准计费逻辑]
-// [修正后逻辑] 
-// 1. 必须是 GET 请求 (排除 HEAD 探测)
-    // 2. 必须是 manifest 请求
-    // 3. URL 不包含 "sha256:" (排除 Docker 内部的架构哈希请求，只记录用户输入的 Tag)
+    
+    // 计费判定条件：GET 请求 + Manifests + 非 SHA256 (只计 Tags)
     const isDockerCharge = isDockerV2 
         && isDockerClient 
         && url.pathname.includes("/manifests/") 
         && request.method === "GET"
         && !url.pathname.includes("sha256:");
 
+    let isCharged = false; // 标记本次请求是否实际扣费
+
     // 如果命中计费条件 且 不在白名单中
     if ((isHtmlRequest || isDockerCharge) && !isWhitelisted) {
       if (usage.count >= CONFIG.DAILY_LIMIT_COUNT) {
         return new Response(`⚠️ 次数超限: IP ${clientIP} 今日已使用 ${usage.count}/${CONFIG.DAILY_LIMIT_COUNT}`, { status: 429 });
       }
-      // 执行计数 +1
-      await incrementIpUsage(clientIP, env);
-      usage.count += 1; // 更新内存变量以便在 UI 显示最新值
-    }
 
-    // --------------------------------------------------------------------------------
-    // 3. Docker 路由分流
-    // --------------------------------------------------------------------------------
-    
-    // 如果是 V2 API 且是 Docker 客户端，走 Docker 专用处理逻辑
-    if (url.pathname.startsWith("/v2/") && isDockerClient) {
-      return handleDockerRequest(request, url);
-    }
-
-    // --------------------------------------------------------------------------------
-    // 4. 网页/通用代理 路由解析
-    // --------------------------------------------------------------------------------
-    const path = url.pathname;
-    const match = path.match(/^\/([^/]+)(?:\/(.*))?$/);
-    
-    // 如果没有匹配到 /密码/ 格式，返回 404
-    if (!match || match[1] !== CONFIG.PASSWORD) {
-      return new Response("404 Not Found", { status: 404 });
-    }
-
-    const targetUrlStr = match[2];
-
-    // --------------------------------------------------------------------------------
-    // 5. 仪表盘渲染 (当没有目标 URL 时)
-    // --------------------------------------------------------------------------------
-    if (!targetUrlStr) {
-      return new Response(renderDashboard(url.hostname, CONFIG.PASSWORD, clientIP, usage.count, CONFIG.DAILY_LIMIT_COUNT), {
-        status: 200,
-        headers: { "Content-Type": "text/html;charset=UTF-8", "Cache-Control": "no-cache" }
-      });
-    }
-
-    // --------------------------------------------------------------------------------
-    // 6. 执行通用代理 (处理 HTML 重写、大文件流式传输等)
-    // --------------------------------------------------------------------------------
-    // 重新构建缓存 Key
-    const proxyUrl = targetUrlStr + (url.search ? url.search : "");
-    const cacheKey = new Request(url.toString(), request);
-    const cache = caches.default;
-
-    // 尝试读取缓存
-    if (CONFIG.ENABLE_CACHE && request.method === "GET") {
-      let cachedResponse = await cache.match(cacheKey);
-      if (cachedResponse) {
-        const newHeaders = new Headers(cachedResponse.headers);
-        newHeaders.set("X-Proxy-Cache", "HIT");
-        return new Response(cachedResponse.body, { status: cachedResponse.status, headers: newHeaders });
+      // [核心修复] 检查防抖缓存：如果是10秒内的重复请求，不扣费
+      const isDuplicate = await checkIsDuplicate(clientIP, url.pathname);
+      
+      if (!isDuplicate) {
+          // 只有非重复请求才扣费
+          await incrementIpUsage(clientIP, env);
+          usage.count += 1; 
+          isCharged = true; 
+          // 设置防抖标记 (异步执行)
+          ctx.waitUntil(setDuplicateFlag(clientIP, url.pathname));
       }
     }
 
-    return handleGeneralProxy(request, proxyUrl, CONFIG, cache, cacheKey, ctx);
+    // --------------------------------------------------------------------------------
+    // 3. 执行核心业务逻辑 (包裹在 Try-Catch 中以支持回滚)
+    // --------------------------------------------------------------------------------
+    let response;
+    try {
+        // Docker 路由分流
+        if (url.pathname.startsWith("/v2/") && isDockerClient) {
+            response = await handleDockerRequest(request, url);
+        } else {
+            // 网页/通用代理 路由解析
+            const path = url.pathname;
+            const match = path.match(/^\/([^/]+)(?:\/(.*))?$/);
+            
+            // 如果没有匹配到 /密码/ 格式，返回 404
+            if (!match || match[1] !== CONFIG.PASSWORD) {
+                return new Response("404 Not Found", { status: 404 });
+            }
+
+            const targetUrlStr = match[2];
+
+            // 仪表盘渲染 (当没有目标 URL 时)
+            if (!targetUrlStr) {
+                return new Response(renderDashboard(url.hostname, CONFIG.PASSWORD, clientIP, usage.count, CONFIG.DAILY_LIMIT_COUNT), {
+                    status: 200,
+                    headers: { "Content-Type": "text/html;charset=UTF-8", "Cache-Control": "no-cache" }
+                });
+            }
+
+            // 执行通用代理
+            const proxyUrl = targetUrlStr + (url.search ? url.search : "");
+            const cacheKey = new Request(url.toString(), request);
+            const cache = caches.default;
+
+            // 尝试读取缓存
+            if (CONFIG.ENABLE_CACHE && request.method === "GET") {
+                let cachedResponse = await cache.match(cacheKey);
+                if (cachedResponse) {
+                    const newHeaders = new Headers(cachedResponse.headers);
+                    newHeaders.set("X-Proxy-Cache", "HIT");
+                    return new Response(cachedResponse.body, { status: cachedResponse.status, headers: newHeaders });
+                }
+            }
+
+            response = await handleGeneralProxy(request, proxyUrl, CONFIG, cache, cacheKey, ctx);
+        }
+
+        // --------------------------------------------------------------------------------
+        // 4. 检查响应状态，决定是否回滚
+        // --------------------------------------------------------------------------------
+        // 如果已收费，但响应状态码 >= 500 (服务器错误) 或 429 (Too Many Requests)，视为失败，回滚额度
+        if (isCharged && response && (response.status >= 500 || response.status === 429)) {
+            ctx.waitUntil(decrementIpUsage(clientIP, env)); // 异步回滚
+        }
+
+        return response;
+
+    } catch (e) {
+        // --------------------------------------------------------------------------------
+        // 5. 异常处理与回滚
+        // --------------------------------------------------------------------------------
+        if (isCharged) {
+            await decrementIpUsage(clientIP, env);
+        }
+        return new Response(JSON.stringify({ 
+            error: "Worker Error", 
+            message: e.message,
+            rollback: isCharged ? "Quota Refunded" : "No Charge" 
+        }), { status: 500 });
+    }
   }
 };
 
 /**
  * -----------------------------------------------------------------------------------------
- * 统计辅助函数 (基于 Cloudflare KV)
+ * 统计与防抖辅助函数 (基于 Cloudflare KV & Cache API)
  * -----------------------------------------------------------------------------------------
  */
+
+// [防抖] 检查是否为重复请求 (10秒内)
+async function checkIsDuplicate(ip, path) {
+    const cache = caches.default;
+    // 构建一个专用的 Cache Key
+    const key = `http://dedup.local/${ip}${path}`; 
+    const response = await cache.match(key);
+    return !!response; // 如果存在，返回 true
+}
+
+// [防抖] 设置重复请求标记
+async function setDuplicateFlag(ip, path) {
+    const cache = caches.default;
+    const key = `http://dedup.local/${ip}${path}`;
+    // 存入一个空响应，过期时间 10 秒。足以覆盖 Docker 客户端的 Auth 重试。
+    const response = new Response("1", { headers: { "Cache-Control": "max-age=10" } });
+    await cache.put(key, response);
+}
+
 async function getIpUsage(ip, env, config) {
   if (!env.IP_LIMIT_KV) return { count: 0, allowed: true };
   const today = new Date().toISOString().split('T')[0];
@@ -224,15 +265,26 @@ async function incrementIpUsage(ip, env) {
   try {
     const val = await env.IP_LIMIT_KV.get(key);
     const current = parseInt(val || "0");
-    // 设置过期时间为 24 小时
     await env.IP_LIMIT_KV.put(key, (current + 1).toString(), { expirationTtl: 86400 });
   } catch(e) {}
+}
+
+async function decrementIpUsage(ip, env) {
+    if (!env.IP_LIMIT_KV) return;
+    const today = new Date().toISOString().split('T')[0];
+    const key = `limit:${ip}:${today}`;
+    try {
+      const val = await env.IP_LIMIT_KV.get(key);
+      let current = parseInt(val || "0");
+      if (current > 0) {
+        await env.IP_LIMIT_KV.put(key, (current - 1).toString(), { expirationTtl: 86400 });
+      }
+    } catch(e) {}
 }
 
 /**
  * -----------------------------------------------------------------------------------------
  * Docker 核心处理逻辑 (Handle Docker Request)
- * 包含：S3 403 修复、401 认证递归、Manifest/Blob 处理
  * -----------------------------------------------------------------------------------------
  */
 async function handleDockerRequest(request, url) {
@@ -241,13 +293,11 @@ async function handleDockerRequest(request, url) {
   let targetPath = path;
   const pathParts = path.split('/');
   
-  // 简单的域名判断逻辑
   if (pathParts.length > 0 && (pathParts[0].includes('.') || DOCKER_REGISTRIES.includes(pathParts[0]))) {
       targetDomain = pathParts[0];
       targetPath = pathParts.slice(1).join('/');
   }
 
-  // 官方库自动补全 library/
   if (targetDomain === 'registry-1.docker.io') {
       const parts = targetPath.split('/');
       if (parts.length > 1 && ['manifests', 'blobs', 'tags'].includes(parts[1])) {
@@ -260,7 +310,6 @@ async function handleDockerRequest(request, url) {
   newHeaders.set('Host', targetDomain);
   newHeaders.set('User-Agent', 'Docker-Client/19.03.1 (linux)');
   
-  // 针对 AWS S3 的特殊签名头处理
   if (isAmazonS3(targetUrl)) {
     newHeaders.set('x-amz-content-sha256', getEmptyBodySHA256());
     newHeaders.set('x-amz-date', new Date().toISOString().replace(/[-:T]/g, '').slice(0, -5) + 'Z');
@@ -271,10 +320,9 @@ async function handleDockerRequest(request, url) {
       method: request.method,
       headers: newHeaders,
       body: request.body,
-      redirect: 'manual' // 手动处理重定向以便修复 Headers
+      redirect: 'manual'
     });
 
-    // 处理 401 Unauthorized (需要获取 Token)
     if (response.status === 401) {
       const wwwAuth = response.headers.get('WWW-Authenticate');
       if (wwwAuth) {
@@ -296,15 +344,13 @@ async function handleDockerRequest(request, url) {
       }
     }
 
-    // 处理 302/307 重定向 (核心：修复 S3 预签名 URL 的 403 Forbidden)
     if (response.status === 307 || response.status === 302) {
       const redirectUrl = response.headers.get('Location');
       if (redirectUrl) {
         const redirectHeaders = new Headers(request.headers);
-        redirectHeaders.delete('Authorization'); // 重定向不携带 Auth
+        redirectHeaders.delete('Authorization');
         redirectHeaders.set('Host', new URL(redirectUrl).hostname);
         
-        // 检查是否为 S3 链接并修复签名
         const isPresigned = redirectUrl.includes('X-Amz-Signature') || redirectUrl.includes('Signature');
         if (isAmazonS3(redirectUrl) && !isPresigned) {
            redirectHeaders.set('x-amz-content-sha256', getEmptyBodySHA256());
@@ -320,18 +366,16 @@ async function handleDockerRequest(request, url) {
       }
     }
 
-    // 构建返回响应
     const newResponse = new Response(response.body, response);
     newResponse.headers.set('Access-Control-Allow-Origin', '*');
     newResponse.headers.set('Docker-Distribution-API-Version', 'registry/2.0');
     return newResponse;
 
   } catch (e) {
-    return new Response(JSON.stringify({ errors: [{ message: `Worker Error: ${e.message}` }] }), { status: 500 });
+      throw e; 
   }
 }
 
-// 获取 Docker Token 的辅助函数
 async function handleDockerToken(realm, service, scope) {
   const tokenUrl = `${realm}?service=${service}&scope=${scope}`;
   try {
@@ -341,26 +385,22 @@ async function handleDockerToken(realm, service, scope) {
   } catch (e) { return null; }
 }
 
-// 辅助函数：判断是否为 S3 域名
 function isAmazonS3(url) {
   return url.includes('amazonaws.com') || url.includes('r2.cloudflarestorage.com');
 }
 
-// 辅助函数：空 Body 的 SHA256 哈希 (用于 S3 签名)
 function getEmptyBodySHA256() {
   return 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
 }
 
 /**
  * -----------------------------------------------------------------------------------------
- * 通用代理处理器 (Handle General Proxy)
- * 包含：流式重写、HTML 重写、大文件传输
+ * 通用代理处理器
  * -----------------------------------------------------------------------------------------
  */
 async function handleGeneralProxy(request, targetUrlStr, CONFIG, cache, cacheKey, ctx) {
     let currentUrlStr = targetUrlStr;
     
-    // 补全协议头
     if (!currentUrlStr.startsWith("http")) {
       currentUrlStr = currentUrlStr.replace(/^(https?):\/+/, '$1://');
       if (!currentUrlStr.startsWith('http')) currentUrlStr = 'https://' + currentUrlStr;
@@ -370,13 +410,11 @@ async function handleGeneralProxy(request, targetUrlStr, CONFIG, cache, cacheKey
     let finalResponse = null;
     const originalHeaders = new Headers(request.headers);
 
-    // 手动处理重定向循环，以支持更多控制
     try {
       while (redirectCount < CONFIG.MAX_REDIRECTS) {
         let currentTargetUrl;
         try { currentTargetUrl = new URL(currentUrlStr); } catch(e) { return new Response("Invalid URL", {status: 400}); }
 
-        // 黑白名单检查
         const domain = currentTargetUrl.hostname;
         if (CONFIG.BLACKLIST.some(k => domain.includes(k))) return new Response("Domain Blacklisted", { status: 403 });
         if (CONFIG.WHITELIST.length > 0 && !CONFIG.WHITELIST.some(k => domain.includes(k))) return new Response("Domain Not in Whitelist", { status: 403 });
@@ -385,15 +423,13 @@ async function handleGeneralProxy(request, targetUrlStr, CONFIG, cache, cacheKey
         newHeaders.set("Host", currentTargetUrl.hostname);
         newHeaders.set("Referer", currentTargetUrl.origin + "/"); 
         newHeaders.set("Origin", currentTargetUrl.origin);
-        newHeaders.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD"); // 兼容 S3
+        newHeaders.set("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
         
-        // 伪装 User-Agent 防止被拦截
         const originalUA = newHeaders.get("User-Agent");
         if (!originalUA || originalUA.includes("curl") || originalUA.includes("wget")) {
             newHeaders.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36");
         }
         
-        // 清理 Cloudflare 特有头部
         newHeaders.delete("Cf-Worker");
         newHeaders.delete("Cf-Ray");
         newHeaders.delete("Cookie"); 
@@ -408,7 +444,6 @@ async function handleGeneralProxy(request, targetUrlStr, CONFIG, cache, cacheKey
 
         const response = await fetch(newRequest);
 
-        // 处理重定向
         if ([301, 302, 303, 307, 308].includes(response.status)) {
           const location = response.headers.get("Location");
           if (location) {
@@ -421,19 +456,17 @@ async function handleGeneralProxy(request, targetUrlStr, CONFIG, cache, cacheKey
         break;
       }
 
-      if (!finalResponse) return new Response("Error: Too many redirects", { status: 502 });
+      if (!finalResponse) throw new Error("Too many redirects");
 
       const contentType = finalResponse.headers.get("content-type") || "";
       const proxyBase = `${new URL(request.url).origin}/${CONFIG.PASSWORD}/`; 
       let shouldCache = true;
 
-      // 如果是 HTML，使用 HTMLRewriter 进行重写
       if (contentType.includes("text/html")) {
         shouldCache = false; 
         return rewriteHtml(finalResponse, proxyBase, currentUrlStr);
       }
       
-      // 如果是脚本或配置文件，使用 TransformStream 流式重写
       if (shouldRewriteScript(contentType, currentUrlStr)) {
         shouldCache = false;
         const { readable, writable } = new TransformStream(new ScriptRewriter(proxyBase));
@@ -448,7 +481,6 @@ async function handleGeneralProxy(request, targetUrlStr, CONFIG, cache, cacheKey
       responseHeaders.set("Access-Control-Allow-Origin", "*");
       responseHeaders.set("X-Proxy-Cache", "MISS");
 
-      // 写入缓存 (针对普通大文件)
       if (CONFIG.ENABLE_CACHE && shouldCache && request.method === "GET" && finalResponse.status === 200) {
         const responseToCache = new Response(finalResponse.body, { status: finalResponse.status, headers: responseHeaders });
         responseToCache.headers.set("Cache-Control", `public, max-age=${CONFIG.CACHE_TTL}`);
@@ -460,11 +492,10 @@ async function handleGeneralProxy(request, targetUrlStr, CONFIG, cache, cacheKey
       return new Response(finalResponse.body, { status: finalResponse.status, headers: responseHeaders });
 
     } catch (e) {
-      return new Response(`Proxy Error: ${e.message}`, { status: 500 });
+      throw e;
     }
 }
 
-// 判断是否需要重写脚本内容的辅助函数
 function shouldRewriteScript(contentType, url) {
   const isText = contentType.includes("text/") || contentType.includes("application/x-sh") || 
                  contentType.includes("application/javascript") || contentType.includes("application/json");
@@ -477,14 +508,13 @@ function shouldRewriteScript(contentType, url) {
 /**
  * -----------------------------------------------------------------------------------------
  * 流式重写类：ScriptRewriter
- * 用于处理 Shell、Python 脚本中的 URL 替换
  * -----------------------------------------------------------------------------------------
  */
 class ScriptRewriter {
   constructor(proxyBase) {
     this.proxyBase = proxyBase;
     this.buffer = "";
-    this.decoder = new TextDecoder("utf-8"); // ✅ 这样就没问题了
+    this.decoder = new TextDecoder("utf-8");
     this.encoder = new TextEncoder();
   }
   transform(chunk, controller) {
@@ -551,7 +581,7 @@ class AttributeRewriter {
 
 /**
  * -----------------------------------------------------------------------------------------
- * UI 仪表盘 (已修复 Tailwind 警告 + 75% 宽度 + 格式化 JSON)
+ * UI 仪表盘 (CSS 已格式化，未压缩)
  * -----------------------------------------------------------------------------------------
  */
 function renderDashboard(hostname, password, ip, count, limit) {
@@ -577,41 +607,130 @@ function renderDashboard(hostname, password, ip, count, limit) {
   <script src="https://cdn.tailwindcss.com"></script>
 
   <style>
-    body { min-height: 100vh; display: flex; align-items: center; justify-content: center; font-family: 'Inter', sans-serif; transition: 0.3s; padding: 1rem; margin: 0; }
-    .light-mode { background: linear-gradient(to bottom right, #f1f5f9, #e2e8f0); color: #111827; }
-    .dark-mode { background: linear-gradient(to bottom right, #1f2937, #374151); color: #e5e7eb; }
-    
+    body {
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-family: 'Inter', sans-serif;
+      transition: 0.3s;
+      padding: 1rem;
+      margin: 0;
+    }
+
+    .light-mode {
+      background: linear-gradient(to bottom right, #f1f5f9, #e2e8f0);
+      color: #111827;
+    }
+
+    .dark-mode {
+      background: linear-gradient(to bottom right, #1f2937, #374151);
+      color: #e5e7eb;
+    }
+
     /* 核心布局：电脑端强制 75% 宽度 */
-    .custom-content-wrapper { 
-      width: 75% !important; 
-      max-width: 1440px !important; 
+    .custom-content-wrapper {
+      width: 75% !important;
+      max-width: 1440px !important;
       min-width: 320px;
-      padding: 2.5rem; 
-      border-radius: 1.5rem; 
-      border: 1px solid #e5e7eb; 
-      box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.1); 
+      padding: 2.5rem;
+      border-radius: 1.5rem;
+      border: 1px solid #e5e7eb;
+      box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.1);
       margin: auto;
       transition: all 0.3s ease;
     }
 
     @media (max-width: 768px) {
-      .custom-content-wrapper { width: 100% !important; padding: 1.25rem; margin: 0.5rem; }
-      h1 { font-size: 1.75rem !important; }
-      .flex-responsive { flex-direction: column !important; }
-      .flex-responsive button { width: 100% !important; margin-top: 0.75rem; }
+      .custom-content-wrapper {
+        width: 100% !important;
+        padding: 1.25rem;
+        margin: 0.5rem;
+      }
+
+      h1 {
+        font-size: 1.75rem !important;
+      }
+
+      .flex-responsive {
+        flex-direction: column !important;
+      }
+
+      .flex-responsive button {
+        width: 100% !important;
+        margin-top: 0.75rem;
+      }
     }
 
-    .light-mode .custom-content-wrapper { background: #ffffff; }
-    .dark-mode .custom-content-wrapper { background: #1f2937; border-color: #374151; }
-    .section-box { background: linear-gradient(to bottom, #ffffff, #f3f4f6); border-radius: 0.75rem; padding: 1.5rem; margin-bottom: 1.5rem; border: 1px solid rgba(0,0,0,0.05); }
-    .dark-mode .section-box { background: linear-gradient(to bottom, #374151, #1f2937); border-color: rgba(255,255,255,0.05); }
-    .theme-toggle { position: fixed; top: 1rem; right: 1rem; padding: 0.6rem; font-size: 1.2rem; cursor: pointer; z-index: 100; border-radius: 9999px; }
-    .toast { position: fixed; bottom: 2rem; left: 50%; transform: translateX(-50%); padding: 0.75rem 2rem; border-radius: 0.75rem; z-index: 200; color: white; opacity: 0; transition: 0.3s; pointer-events: none; }
-    .toast.show { opacity: 1; }
-    input[type="text"] { border: 1px solid #d1d5db !important; transition: 0.2s; }
-    input[type="text"]:focus { border-color: #3b82f6 !important; ring: 2px #3b82f6; }
-    .select-all { cursor: pointer; user-select: all; }
-    .select-all:hover { opacity: 0.8; }
+    .light-mode .custom-content-wrapper {
+      background: #ffffff;
+    }
+
+    .dark-mode .custom-content-wrapper {
+      background: #1f2937;
+      border-color: #374151;
+    }
+
+    .section-box {
+      background: linear-gradient(to bottom, #ffffff, #f3f4f6);
+      border-radius: 0.75rem;
+      padding: 1.5rem;
+      margin-bottom: 1.5rem;
+      border: 1px solid rgba(0, 0, 0, 0.05);
+    }
+
+    .dark-mode .section-box {
+      background: linear-gradient(to bottom, #374151, #1f2937);
+      border-color: rgba(255, 255, 255, 0.05);
+    }
+
+    .theme-toggle {
+      position: fixed;
+      top: 1rem;
+      right: 1rem;
+      padding: 0.6rem;
+      font-size: 1.2rem;
+      cursor: pointer;
+      z-index: 100;
+      border-radius: 9999px;
+    }
+
+    .toast {
+      position: fixed;
+      bottom: 2rem;
+      left: 50%;
+      transform: translateX(-50%);
+      padding: 0.75rem 2rem;
+      border-radius: 0.75rem;
+      z-index: 200;
+      color: white;
+      opacity: 0;
+      transition: 0.3s;
+      pointer-events: none;
+    }
+
+    .toast.show {
+      opacity: 1;
+    }
+
+    input[type="text"] {
+      border: 1px solid #d1d5db !important;
+      transition: 0.2s;
+    }
+
+    input[type="text"]:focus {
+      border-color: #3b82f6 !important;
+      ring: 2px #3b82f6;
+    }
+
+    .select-all {
+      cursor: pointer;
+      user-select: all;
+    }
+
+    .select-all:hover {
+      opacity: 0.8;
+    }
   </style>
 </head>
 <body class="light-mode">
@@ -630,7 +749,7 @@ function renderDashboard(hostname, password, ip, count, limit) {
       <div class="w-full bg-gray-200 dark:bg-gray-700 rounded-full h-1.5 overflow-hidden">
         <div class="bg-blue-600 h-full transition-all duration-1000" style="width: ${percent}%"></div>
       </div>
-      <p class="text-[10px] text-gray-400 mt-2 italic text-center">💡 精准计费：仅 HTML 网页跳转与 Docker 拉取时计费。资源加载免费。</p>
+      <p class="text-[10px] text-gray-400 mt-2 italic text-center">💡 计费说明：请求失败自动退还额度；短时重复请求不扣费。</p>
     </div>
 
     <div class="section-box">
@@ -653,7 +772,7 @@ function renderDashboard(hostname, password, ip, count, limit) {
       <button onclick="convertDockerImage()" class="bg-blue-500 text-white px-6 py-3 rounded-xl hover:bg-blue-600 transition font-bold text-sm shadow-md">获取命令</button>
     </div>
     
-    <p class="text-[12px] text-orange-500 mt-2 font-medium">💡 提示：因 Docker 协议机制，拉取一次镜像会计入 2 次使用次数。</p>
+    <p class="text-[12px] text-green-500 mt-2 font-medium">💡 提示：支持 library 自动补全，支持多架构镜像。</p>
 
     <p id="docker-result" class="mt-4 p-3 text-green-600 dark:text-green-400 bg-green-50 dark:bg-green-900/20 rounded-lg hidden font-mono text-xs break-all border border-green-200 dark:border-green-800"></p>
     <div id="docker-buttons" class="flex gap-2 mt-4 hidden">
