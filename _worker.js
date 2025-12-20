@@ -856,7 +856,7 @@ const DEFAULT_CONFIG = {
           
           <div class="code-area rounded-lg p-4 overflow-x-auto text-sm">
               <p class="text-gray-500 dark:text-gray-500 mb-1"># 1. 编辑配置文件</p>
-              <p class="font-mono text-blue-600 dark:text-blue-400 font-bold mb-4 select-all">nano /etc/docker/daemon.json</p>
+              <p class="font-mono text-blue-600 dark:text-blue-400 font-bold mb-4 select-all">vim /etc/docker/daemon.json</p>
               
               <p class="text-gray-500 dark:text-gray-500 mb-1"># 2. 填入以下内容</p>
               <pre id="daemon-json-content" class="font-mono text-emerald-600 dark:text-emerald-400 mb-4 select-all bg-transparent p-0 border-0"></pre>
