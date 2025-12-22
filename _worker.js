@@ -1,12 +1,12 @@
 /**
  * -----------------------------------------------------------------------------------------
- * Cloudflare Worker: 终极 Docker 代理 (Dockerfile/BuildKit 完美兼容版)
+ * Cloudflare Worker: 终极 Docker 代理 (Dockerfile/BuildKit 完美兼容版 + CSP 修复 + UI 优化)
  * -----------------------------------------------------------------------------------------
  *
  * 【本次修复重点】
- * 1. [BuildKit] 修复 docker build 时 "metadata not found" 错误。
- * 2. [正则补全] 使用更暴力的正则强制补全 library/，不再依赖路径分割。
- * 3. [根路径] 修复 /v2/ 根探测请求，解决部分客户端握手失败问题。
+ * 1. [UI体验] 修复 Daemon.json 配置区域无法“部分选择”文字的问题（移除了强制全选样式）。
+ * 2. [CSP] 保持 GitHub/其他网站样式正常加载。
+ * 3. [BuildKit] 保持 docker build 兼容性。
  *
  * -----------------------------------------------------------------------------------------
  */
@@ -948,13 +948,13 @@ function renderDashboard(hostname, password, ip, count, limit) {
           
           <div class="code-area rounded-lg p-4 overflow-x-auto text-sm">
               <p class="text-gray-500 dark:text-gray-500 mb-1"># 1. 编辑配置文件</p>
-              <p class="font-mono text-blue-600 dark:text-blue-400 font-bold mb-4 select-all">vim /etc/docker/daemon.json</p>
+              <p class="font-mono text-blue-600 dark:text-blue-400 font-bold mb-4">vim /etc/docker/daemon.json</p>
               
               <p class="text-gray-500 dark:text-gray-500 mb-1"># 2. 填入以下内容</p>
-              <pre id="daemon-json-content" class="font-mono text-emerald-600 dark:text-emerald-400 mb-4 select-all bg-transparent p-0 border-0"></pre>
+              <pre id="daemon-json-content" class="font-mono text-emerald-600 dark:text-emerald-400 mb-4 bg-transparent p-0 border-0"></pre>
               
               <p class="text-gray-500 dark:text-gray-500 mb-1"># 3. 重启 Docker</p>
-              <p class="font-mono text-blue-600 dark:text-blue-400 font-bold select-all">sudo systemctl daemon-reload && sudo systemctl restart docker</p>
+              <p class="font-mono text-blue-600 dark:text-blue-400 font-bold">sudo systemctl daemon-reload && sudo systemctl restart docker</p>
           </div>
           
           <button onclick="copyDaemonJson()" class="mt-4 px-4 py-2 bg-gray-800 dark:bg-white hover:bg-black dark:hover:bg-gray-200 text-white dark:text-black rounded-lg text-xs font-bold transition shadow-sm flex items-center gap-2">
