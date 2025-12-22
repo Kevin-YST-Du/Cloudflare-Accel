@@ -212,6 +212,9 @@ export default {
                     if (cachedResponse) {
                         const newHeaders = new Headers(cachedResponse.headers);
                         newHeaders.set("X-Proxy-Cache", "HIT");
+                        // 确保缓存的响应也没有 CSP
+                        newHeaders.delete("Content-Security-Policy"); 
+                        newHeaders.delete("content-security-policy");
                         return new Response(cachedResponse.body, { status: cachedResponse.status, headers: newHeaders });
                     }
                 }
@@ -327,14 +330,10 @@ async function handleDockerRequest(request, url) {
     // 2. Docker Hub 强制补全 (使用正则，更精准)
     // 解决 docker build 时 meta data not found
     if (targetDomain === 'registry-1.docker.io') {
-        // 正则说明：匹配以 "非斜杠字符" 开头，紧跟着 /manifests 或 /blobs 或 /tags 的路径
-        // 捕获组 1 是镜像名。如果匹配成功，说明是单段镜像名 (如 nginx/manifests/...)
         const libraryRegex = /^([^/]+)\/(manifests|blobs|tags)/;
         const match = path.match(libraryRegex);
         
         if (match) {
-            // match[1] 是镜像名 (例如 nginx)
-            // 只要不是 library 本身，就补全
             if (match[1] !== 'library') {
                 path = 'library/' + path;
             }
@@ -402,7 +401,7 @@ async function handleDockerRequest(request, url) {
 }
 
 // -----------------------------------------------------------------------------------------
-// 辅助函数 (保持不变)
+// 辅助函数
 // -----------------------------------------------------------------------------------------
 
 function isAmazonS3(url) {
@@ -476,7 +475,7 @@ async function resetIpUsage(ip, env) {
 }
 
 // -----------------------------------------------------------------------------------------
-// 通用代理处理器 (保持不变)
+// 通用代理处理器 (重点修改了这里的 CSP 处理)
 // -----------------------------------------------------------------------------------------
 async function handleGeneralProxy(request, targetUrlStr, CONFIG, cache, cacheKey, ctx) {
     let currentUrlStr = targetUrlStr;
@@ -548,17 +547,29 @@ async function handleGeneralProxy(request, targetUrlStr, CONFIG, cache, cacheKey
         
         if (shouldRewriteScript(contentType, currentUrlStr)) {
             shouldCache = false;
-            const { readable, writable } = new TransformStream(new ScriptRewriter(proxyBase));
-            finalResponse.body.pipeTo(writable).catch(err => console.log(err));
+            // 【FIXED】移除 CSP 以允许脚本执行
             const responseHeaders = new Headers(finalResponse.headers);
+            responseHeaders.delete("Content-Security-Policy");
+            responseHeaders.delete("content-security-policy");
+            responseHeaders.delete("X-Content-Security-Policy");
             responseHeaders.set("Access-Control-Allow-Origin", "*");
             responseHeaders.delete("Content-Length");
+
+            const { readable, writable } = new TransformStream(new ScriptRewriter(proxyBase));
+            finalResponse.body.pipeTo(writable).catch(err => console.log(err));
+            
             return new Response(readable, { status: finalResponse.status, headers: responseHeaders });
         }
 
         const responseHeaders = new Headers(finalResponse.headers);
         responseHeaders.set("Access-Control-Allow-Origin", "*");
         responseHeaders.set("X-Proxy-Cache", "MISS");
+        
+        // 【FIXED】移除 CSP 以允许资源加载 (CSS/IMG/Fonts)
+        responseHeaders.delete("Content-Security-Policy");
+        responseHeaders.delete("content-security-policy");
+        responseHeaders.delete("X-Content-Security-Policy");
+        responseHeaders.delete("Strict-Transport-Security");
 
         if (CONFIG.ENABLE_CACHE && shouldCache && request.method === "GET" && finalResponse.status === 200) {
             const responseToCache = new Response(finalResponse.body, { status: finalResponse.status, headers: responseHeaders });
@@ -585,7 +596,7 @@ function shouldRewriteScript(contentType, url) {
 }
 
 // -----------------------------------------------------------------------------------------
-// HTML重写与UI (保持不变)
+// HTML重写与UI
 // -----------------------------------------------------------------------------------------
 class ScriptRewriter {
     constructor(proxyBase) {
@@ -627,11 +638,25 @@ function rewriteHtml(response, proxyBase, targetUrlStr) {
         .on("script", new AttributeRewriter("src", proxyBase, targetUrlStr))
         .on("form", new AttributeRewriter("action", proxyBase, targetUrlStr));
 
+    // 【FIXED】正确处理响应头
     const newHeaders = new Headers(response.headers);
     newHeaders.delete("Content-Security-Policy");
+    newHeaders.delete("content-security-policy");
+    newHeaders.delete("X-Content-Security-Policy");
+    newHeaders.delete("X-WebKit-CSP");
+    newHeaders.delete("Strict-Transport-Security");
+    
     newHeaders.delete("Content-Length");
     newHeaders.set("Access-Control-Allow-Origin", "*");
-    return rewriter.transform(response);
+    
+    // 注意：HTMLRewriter.transform 返回的 Response 会继承原有的 headers，
+    // 我们必须用新的 headers 重新包装一次，才能确保 delete 生效。
+    const transformedResponse = rewriter.transform(response);
+    
+    return new Response(transformedResponse.body, {
+        status: transformedResponse.status,
+        headers: newHeaders
+    });
 }
 
 class AttributeRewriter {
@@ -651,6 +676,9 @@ class AttributeRewriter {
     }
 }
 
+// -----------------------------------------------------------------------------------------
+// Dashboard 渲染函数 (保留原版完整 UI)
+// -----------------------------------------------------------------------------------------
 function renderDashboard(hostname, password, ip, count, limit) {
     const percent = Math.min(Math.round((count / limit) * 100), 100);
     
@@ -939,7 +967,7 @@ function renderDashboard(hostname, password, ip, count, limit) {
             <a href="https://github.com/Kevin-YST-Du/Cloudflare-Accel" 
                 target="_blank" 
                 class="text-[10px] text-blue-600 dark:text-blue-400 uppercase tracking-widest font-bold opacity-80 hover:opacity-100 hover:underline transition-all">
-       Powered by Kevin-YST-Du/Cloudflare-Accel
+        Powered by Kevin-YST-Du/Cloudflare-Accel
     </a>
 </footer>
     </div>
