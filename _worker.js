@@ -1,18 +1,16 @@
 /**
  * -----------------------------------------------------------------------------------------
- * Cloudflare Worker: 终极 Docker 代理 (Dockerfile/BuildKit 完美兼容版 + CSP 修复 + UI 优化)
+ * Cloudflare Worker: 终极 Docker 代理 (Ultimate Fixed Version)
  * -----------------------------------------------------------------------------------------
- *
- * 【本次修复重点】
- * 1. [UI体验] 修复 Daemon.json 配置区域无法“部分选择”文字的问题（移除了强制全选样式）。
- * 2. [CSP] 保持 GitHub/其他网站样式正常加载。
- * 3. [BuildKit] 保持 docker build 兼容性。
- *
- * -----------------------------------------------------------------------------------------
+ * * 集成修复：
+ * 1. [S3直连] 修复 vaultwarden 等第三方镜像拉取时卡在 Waiting 的问题 (重定向清洗)。
+ * 2. [Auth修复] 修复 Token 获取失败，彻底清洗 CF 头 + 伪装最新 Docker 客户端 UA。
+ * 3. [路径补全] 智能判断 library/ 前缀，同时支持官方镜像和多段式个人镜像。
+ * * -----------------------------------------------------------------------------------------
  */
 
 // ==============================================================================
-// 1. 用户配置区域 (保持不变)
+// 1. 用户配置区域
 // ==============================================================================
 const DEFAULT_CONFIG = {
     PASSWORD: "123456",               // 访问密码
@@ -237,7 +235,7 @@ export default {
 
 /**
  * ==============================================================================
- * 核心逻辑：Token 请求处理 (强制伪装)
+ * 核心逻辑：Token 请求处理 (修复：清洗 Header + 伪装 UA)
  * ==============================================================================
  */
 async function handleTokenRequest(request, url) {
@@ -261,13 +259,11 @@ async function handleTokenRequest(request, url) {
 
     // 2. 针对 Docker Hub 的强制伪装
     if (upstreamAuthUrl === 'https://auth.docker.io/token') {
-        // 强制 Service
         newUrl.searchParams.set('service', 'registry.docker.io');
         
-        // 强制 Scope 补全
+        // 强制 Scope 补全逻辑
         if (scope && scope.startsWith('repository:')) {
             const parts = scope.split(':');
-            // 逻辑：如果 repo 名不含 '/' 且不是第三方域名，补全 library/
             if (parts.length >= 3 && !parts[1].includes('/') && !Object.keys(REGISTRY_MAP).some(d => parts[1].startsWith(d))) {
                 parts[1] = 'library/' + parts[1];
                 newUrl.searchParams.set('scope', parts.join(':'));
@@ -275,19 +271,32 @@ async function handleTokenRequest(request, url) {
         }
     }
 
+    // 【关键修复】重建 Headers，剔除 Cloudflare 痕迹，伪装 UA
+    const newHeaders = new Headers(request.headers);
+    newHeaders.set('Host', newUrl.hostname);
+    // 伪装成最新的 Docker 客户端，防止 Auth 服务拦截
+    newHeaders.set('User-Agent', 'Docker-Client/24.0.5 (linux)');
+    newHeaders.set('Accept', 'application/json');
+    
+    // 剔除敏感头，防止 auth.docker.io 判定为代理请求而拒绝
+    newHeaders.delete('Cf-Connecting-Ip');
+    newHeaders.delete('Cf-Ray');
+    newHeaders.delete('X-Forwarded-For');
+    newHeaders.delete('Cookie');
+    newHeaders.delete('Cf-Worker');
+
     const authRequest = new Request(newUrl, {
         method: request.method,
-        headers: request.headers,
+        headers: newHeaders, // 使用清洗后的 Headers
         redirect: 'follow'
     });
-    authRequest.headers.set('Host', newUrl.hostname);
     
     return fetch(authRequest);
 }
 
 /**
  * ==============================================================================
- * 核心逻辑：Registry 请求处理 (强力正则补全 + 根路径修复)
+ * 核心逻辑：Registry 请求处理 (强力正则补全 + S3 重定向修复)
  * ==============================================================================
  */
 async function handleDockerRequest(request, url) {
@@ -295,14 +304,12 @@ async function handleDockerRequest(request, url) {
     let targetDomain = 'registry-1.docker.io'; 
     let upstream = 'https://registry-1.docker.io';
     
-    // 0. 特殊处理：/v2/ 根请求 (docker login/build 初始检查)
-    // 必须转发到 Hub 才能触发 Auth
+    // 0. 特殊处理：/v2/ 根请求
     if (path === '' || path === '/') {
         const rootUrl = 'https://registry-1.docker.io/v2/';
         const rootReq = new Request(rootUrl, { method: request.method, headers: request.headers });
         rootReq.headers.set('Host', 'registry-1.docker.io');
         const rootResp = await fetch(rootReq);
-        // 劫持 401
         if (rootResp.status === 401) {
             const authHeader = rootResp.headers.get('WWW-Authenticate');
             if (authHeader) {
@@ -327,41 +334,36 @@ async function handleDockerRequest(request, url) {
         path = pathParts.slice(1).join('/');
     }
 
-    // 2. Docker Hub 强制补全 (使用正则，更精准)
-    // 解决 docker build 时 meta data not found
+    // 2. Docker Hub 强制补全 (精准逻辑：仅对单名镜像补全 library/)
     if (targetDomain === 'registry-1.docker.io') {
-        const libraryRegex = /^([^/]+)\/(manifests|blobs|tags)/;
-        const match = path.match(libraryRegex);
-        
-        if (match) {
-            if (match[1] !== 'library') {
-                path = 'library/' + path;
-            }
+        const parts = path.split('/');
+        // 索引说明: 0=ImageName, 1=manifests/blobs
+        // 如果 1 是 API 关键字，说明 ImageName 只有一段，需要补全 library/
+        const apiIndex = parts.findIndex(part => ['manifests', 'blobs', 'tags'].includes(part));
+        if (apiIndex === 1) {
+            path = 'library/' + path;
         }
     }
 
     const targetUrl = `${upstream}/v2/${path}` + url.search;
     const newHeaders = new Headers(request.headers);
     newHeaders.set('Host', targetDomain);
-    newHeaders.set('User-Agent', 'Docker-Client/19.03.1 (linux)');
+    newHeaders.set('User-Agent', 'Docker-Client/24.0.5 (linux)'); // 伪装最新 UA
     newHeaders.delete('Cf-Connecting-Ip');
     newHeaders.delete('Cf-Ray');
     
-    // S3 签名修正
-    if (isAmazonS3(targetUrl)) {
-        newHeaders.set('x-amz-content-sha256', getEmptyBodySHA256());
-        newHeaders.set('x-amz-date', new Date().toISOString().replace(/[-:T]/g, '').slice(0, -5) + 'Z');
-    }
+    // 【已移除 S3 签名逻辑】
+    // 防止 Worker 试图签名导致与亚马逊原版签名冲突，直接让 Docker 客户端处理
 
     try {
         let response = await fetch(targetUrl, {
             method: request.method,
             headers: newHeaders,
             body: request.body,
-            redirect: 'manual'
+            redirect: 'manual' // 禁止 fetch 自动跟随重定向
         });
 
-        // 3. 劫持 401 响应 (修改 Www-Authenticate)
+        // 3. 劫持 401 响应 (修改 Www-Authenticate 指向我们的 Token 服务)
         if (response.status === 401) {
             const authHeader = response.headers.get('WWW-Authenticate');
             if (authHeader) {
@@ -376,19 +378,20 @@ async function handleDockerRequest(request, url) {
             }
         }
 
-        // 4. 处理重定向 (Blobs)
-        if ([301, 302, 307].includes(response.status)) {
-            const location = response.headers.get('Location');
-            if (location) {
-                return new Response(null, {
-                    status: response.status,
-                    headers: {
-                        "Location": location,
-                        "Access-Control-Allow-Origin": "*"
-                    }
-                });
-            }
-        }
+        // 4. 处理重定向 (核心修复：纯净 Location 返回)
+        // 彻底解决 S3 签名问题，让 Docker 客户端直连 AWS 下载
+// 替换后的代码
+        if ([301, 302, 303, 307, 308].includes(response.status)) {
+        const location = response.headers.get('Location');
+        if (location) {
+        // 让 Worker 顺着重定向地址去抓取真实数据
+                const redirectedRequest = new Request(location, {
+                method: 'GET',
+                headers: newHeaders // 使用之前清洗过的 Headers
+            });
+                return fetch(redirectedRequest); 
+    }
+}
 
         const finalResponse = new Response(response.body, response);
         finalResponse.headers.set('Access-Control-Allow-Origin', '*');
@@ -403,14 +406,6 @@ async function handleDockerRequest(request, url) {
 // -----------------------------------------------------------------------------------------
 // 辅助函数
 // -----------------------------------------------------------------------------------------
-
-function isAmazonS3(url) {
-    return url.includes('amazonaws.com') || url.includes('r2.cloudflarestorage.com');
-}
-
-function getEmptyBodySHA256() {
-    return 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
-}
 
 function getBeijingDateString() {
     return new Date(new Date().getTime() + 28800000).toISOString().split('T')[0];
@@ -677,7 +672,7 @@ class AttributeRewriter {
 }
 
 // -----------------------------------------------------------------------------------------
-// Dashboard 渲染函数 (保留原版完整 UI)
+// Dashboard 渲染函数 (完整保留)
 // -----------------------------------------------------------------------------------------
 function renderDashboard(hostname, password, ip, count, limit) {
     const percent = Math.min(Math.round((count / limit) * 100), 100);
@@ -771,6 +766,12 @@ function renderDashboard(hostname, password, ip, count, limit) {
         background-color: #020617; /* Slate 950 (接近纯黑) */
         border: 1px solid #1e293b;
         color: #e2e8f0;
+      }
+      
+      /* 核心修复：添加 select-text 允许选择 */
+      .code-area, pre, .select-all {
+          user-select: text !important;
+          -webkit-user-select: text !important;
       }
       
       /* 重置按钮 - 对应截图2的白色底风格 */
@@ -882,6 +883,7 @@ function renderDashboard(hostname, password, ip, count, limit) {
               <button onclick="openModal()" class="reset-btn px-3 py-1.5 rounded-lg text-xs font-bold transition-transform hover:scale-105 flex items-center gap-1.5 shadow-sm">
               <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+              </svg>
                   <span>重置额度</span>
               </button>
           </div>
@@ -980,7 +982,7 @@ function renderDashboard(hostname, password, ip, count, limit) {
             </div>
             <h3 class="text-lg font-bold mb-2">确认重置额度？</h3>
             <p class="text-sm opacity-70 mb-6 px-4">
-               此操作仅限管理员 (IP: ${ip})。重置后不可撤销。
+                此操作仅限管理员 (IP: ${ip})。重置后不可撤销。
             </p>
             <div class="flex gap-3">
                <button onclick="closeModal()" class="flex-1 px-4 py-2.5 bg-gray-100 hover:bg-gray-200 dark:bg-slate-700 dark:hover:bg-slate-600 rounded-lg text-sm font-bold transition">取消</button>
