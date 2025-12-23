@@ -1,11 +1,11 @@
 /**
  * -----------------------------------------------------------------------------------------
- * Cloudflare Worker: 终极 Docker 代理 (Ultimate Fixed Version)
+ * Cloudflare Worker: 终极 Docker 代理 (GitHub UI 集成版)
  * -----------------------------------------------------------------------------------------
- * * 集成修复：
- * 1. [S3直连] 修复 vaultwarden 等第三方镜像拉取时卡在 Waiting 的问题 (重定向清洗)。
- * 2. [Auth修复] 修复 Token 获取失败，彻底清洗 CF 头 + 伪装最新 Docker 客户端 UA。
- * 3. [路径补全] 智能判断 library/ 前缀，同时支持官方镜像和多段式个人镜像。
+ * * 核心功能：
+ * 1. [强制中转] 拦截所有 S3 重定向，由 Worker 代为下载并流式回传，解决服务器连接 S3 超时(i/o timeout)问题。
+ * 2. [流式传输] 使用 TransformStream 实现管道传输，支持 GB 级大文件，不受 Worker 内存限制。
+ * 3. [UI 优化] 右上角增加 GitHub 仓库跳转按钮，优化黑夜模式体验。
  * * -----------------------------------------------------------------------------------------
  */
 
@@ -88,7 +88,7 @@ export default {
         const acceptHeader = (request.headers.get("Accept") || "").toLowerCase();
         const userAgent = (request.headers.get("User-Agent") || "").toLowerCase();
         
-        // 识别是否为 Docker 客户端 (增加 buildkit 识别)
+        // 识别是否为 Docker 客户端
         const isDockerClient = userAgent.includes("docker") || userAgent.includes("go-http") || userAgent.includes("containerd") || userAgent.includes("buildkit");
         const isDockerV2 = url.pathname.startsWith("/v2/");
 
@@ -174,7 +174,7 @@ export default {
         let response;
         try {
             if (isDockerV2) {
-                // 只要是 V2 路径，全部交给 Docker 处理逻辑 (确保 docker build 兼容)
+                // 只要是 V2 路径，全部交给 Docker 处理逻辑
                 response = await handleDockerRequest(request, url);
             } else {
                 // 网页/通用代理逻辑
@@ -210,7 +210,6 @@ export default {
                     if (cachedResponse) {
                         const newHeaders = new Headers(cachedResponse.headers);
                         newHeaders.set("X-Proxy-Cache", "HIT");
-                        // 确保缓存的响应也没有 CSP
                         newHeaders.delete("Content-Security-Policy"); 
                         newHeaders.delete("content-security-policy");
                         return new Response(cachedResponse.body, { status: cachedResponse.status, headers: newHeaders });
@@ -235,12 +234,11 @@ export default {
 
 /**
  * ==============================================================================
- * 核心逻辑：Token 请求处理 (修复：清洗 Header + 伪装 UA)
+ * 核心逻辑：Token 请求处理
  * ==============================================================================
  */
 async function handleTokenRequest(request, url) {
     const scope = url.searchParams.get('scope');
-    const service = url.searchParams.get('service');
     
     let upstreamAuthUrl = 'https://auth.docker.io/token'; 
     
@@ -271,14 +269,12 @@ async function handleTokenRequest(request, url) {
         }
     }
 
-    // 【关键修复】重建 Headers，剔除 Cloudflare 痕迹，伪装 UA
+    // 重建 Headers，剔除 Cloudflare 痕迹，伪装 UA
     const newHeaders = new Headers(request.headers);
     newHeaders.set('Host', newUrl.hostname);
-    // 伪装成最新的 Docker 客户端，防止 Auth 服务拦截
     newHeaders.set('User-Agent', 'Docker-Client/24.0.5 (linux)');
     newHeaders.set('Accept', 'application/json');
     
-    // 剔除敏感头，防止 auth.docker.io 判定为代理请求而拒绝
     newHeaders.delete('Cf-Connecting-Ip');
     newHeaders.delete('Cf-Ray');
     newHeaders.delete('X-Forwarded-For');
@@ -287,7 +283,7 @@ async function handleTokenRequest(request, url) {
 
     const authRequest = new Request(newUrl, {
         method: request.method,
-        headers: newHeaders, // 使用清洗后的 Headers
+        headers: newHeaders,
         redirect: 'follow'
     });
     
@@ -296,7 +292,7 @@ async function handleTokenRequest(request, url) {
 
 /**
  * ==============================================================================
- * 核心逻辑：Registry 请求处理 (强力正则补全 + S3 重定向修复)
+ * 核心逻辑：Registry 请求处理 (流式中转)
  * ==============================================================================
  */
 async function handleDockerRequest(request, url) {
@@ -334,11 +330,9 @@ async function handleDockerRequest(request, url) {
         path = pathParts.slice(1).join('/');
     }
 
-    // 2. Docker Hub 强制补全 (精准逻辑：仅对单名镜像补全 library/)
+    // 2. Docker Hub 强制补全
     if (targetDomain === 'registry-1.docker.io') {
         const parts = path.split('/');
-        // 索引说明: 0=ImageName, 1=manifests/blobs
-        // 如果 1 是 API 关键字，说明 ImageName 只有一段，需要补全 library/
         const apiIndex = parts.findIndex(part => ['manifests', 'blobs', 'tags'].includes(part));
         if (apiIndex === 1) {
             path = 'library/' + path;
@@ -348,22 +342,23 @@ async function handleDockerRequest(request, url) {
     const targetUrl = `${upstream}/v2/${path}` + url.search;
     const newHeaders = new Headers(request.headers);
     newHeaders.set('Host', targetDomain);
-    newHeaders.set('User-Agent', 'Docker-Client/24.0.5 (linux)'); // 伪装最新 UA
+    newHeaders.set('User-Agent', 'Docker-Client/24.0.5 (linux)');
     newHeaders.delete('Cf-Connecting-Ip');
     newHeaders.delete('Cf-Ray');
     
-    // 【已移除 S3 签名逻辑】
-    // 防止 Worker 试图签名导致与亚马逊原版签名冲突，直接让 Docker 客户端处理
+    if (request.headers.get('Range')) {
+        newHeaders.set('Range', request.headers.get('Range'));
+    }
 
     try {
         let response = await fetch(targetUrl, {
             method: request.method,
             headers: newHeaders,
             body: request.body,
-            redirect: 'manual' // 禁止 fetch 自动跟随重定向
+            redirect: 'manual'
         });
 
-        // 3. 劫持 401 响应 (修改 Www-Authenticate 指向我们的 Token 服务)
+        // 3. 劫持 401
         if (response.status === 401) {
             const authHeader = response.headers.get('WWW-Authenticate');
             if (authHeader) {
@@ -378,20 +373,13 @@ async function handleDockerRequest(request, url) {
             }
         }
 
-        // 4. 处理重定向 (核心修复：纯净 Location 返回)
-        // 彻底解决 S3 签名问题，让 Docker 客户端直连 AWS 下载
-// 替换后的代码
+        // 4. 强制流式代理下载
         if ([301, 302, 303, 307, 308].includes(response.status)) {
-        const location = response.headers.get('Location');
-        if (location) {
-        // 让 Worker 顺着重定向地址去抓取真实数据
-                const redirectedRequest = new Request(location, {
-                method: 'GET',
-                headers: newHeaders // 使用之前清洗过的 Headers
-            });
-                return fetch(redirectedRequest); 
-    }
-}
+            const location = response.headers.get('Location');
+            if (location) {
+                return handleBlobProxy(location, request);
+            }
+        }
 
         const finalResponse = new Response(response.body, response);
         finalResponse.headers.set('Access-Control-Allow-Origin', '*');
@@ -402,6 +390,38 @@ async function handleDockerRequest(request, url) {
         throw e;
     }
 }
+
+/**
+ * ==============================================================================
+ * 核心逻辑：Blob 流式代理
+ * ==============================================================================
+ */
+async function handleBlobProxy(targetUrl, originalRequest) {
+    const newHeaders = new Headers();
+    newHeaders.set('User-Agent', 'Docker-Client/24.0.5 (linux)');
+    
+    const range = originalRequest.headers.get('Range');
+    if (range) {
+        newHeaders.set('Range', range);
+    }
+
+    const response = await fetch(targetUrl, {
+        method: 'GET',
+        headers: newHeaders
+    });
+
+    const proxyHeaders = new Headers(response.headers);
+    proxyHeaders.set('Access-Control-Allow-Origin', '*');
+    
+    const { readable, writable } = new TransformStream();
+    response.body.pipeTo(writable);
+
+    return new Response(readable, {
+        status: response.status,
+        headers: proxyHeaders
+    });
+}
+
 
 // -----------------------------------------------------------------------------------------
 // 辅助函数
@@ -470,7 +490,7 @@ async function resetIpUsage(ip, env) {
 }
 
 // -----------------------------------------------------------------------------------------
-// 通用代理处理器 (重点修改了这里的 CSP 处理)
+// 通用代理处理器
 // -----------------------------------------------------------------------------------------
 async function handleGeneralProxy(request, targetUrlStr, CONFIG, cache, cacheKey, ctx) {
     let currentUrlStr = targetUrlStr;
@@ -542,7 +562,6 @@ async function handleGeneralProxy(request, targetUrlStr, CONFIG, cache, cacheKey
         
         if (shouldRewriteScript(contentType, currentUrlStr)) {
             shouldCache = false;
-            // 【FIXED】移除 CSP 以允许脚本执行
             const responseHeaders = new Headers(finalResponse.headers);
             responseHeaders.delete("Content-Security-Policy");
             responseHeaders.delete("content-security-policy");
@@ -560,7 +579,6 @@ async function handleGeneralProxy(request, targetUrlStr, CONFIG, cache, cacheKey
         responseHeaders.set("Access-Control-Allow-Origin", "*");
         responseHeaders.set("X-Proxy-Cache", "MISS");
         
-        // 【FIXED】移除 CSP 以允许资源加载 (CSS/IMG/Fonts)
         responseHeaders.delete("Content-Security-Policy");
         responseHeaders.delete("content-security-policy");
         responseHeaders.delete("X-Content-Security-Policy");
@@ -633,7 +651,6 @@ function rewriteHtml(response, proxyBase, targetUrlStr) {
         .on("script", new AttributeRewriter("src", proxyBase, targetUrlStr))
         .on("form", new AttributeRewriter("action", proxyBase, targetUrlStr));
 
-    // 【FIXED】正确处理响应头
     const newHeaders = new Headers(response.headers);
     newHeaders.delete("Content-Security-Policy");
     newHeaders.delete("content-security-policy");
@@ -644,8 +661,6 @@ function rewriteHtml(response, proxyBase, targetUrlStr) {
     newHeaders.delete("Content-Length");
     newHeaders.set("Access-Control-Allow-Origin", "*");
     
-    // 注意：HTMLRewriter.transform 返回的 Response 会继承原有的 headers，
-    // 我们必须用新的 headers 重新包装一次，才能确保 delete 生效。
     const transformedResponse = rewriter.transform(response);
     
     return new Response(transformedResponse.body, {
@@ -672,7 +687,7 @@ class AttributeRewriter {
 }
 
 // -----------------------------------------------------------------------------------------
-// Dashboard 渲染函数 (完整保留)
+// Dashboard 渲染函数 (包含 GitHub 图标)
 // -----------------------------------------------------------------------------------------
 function renderDashboard(hostname, password, ip, count, limit) {
     const percent = Math.min(Math.round((count / limit) * 100), 100);
@@ -710,7 +725,7 @@ function renderDashboard(hostname, password, ip, count, limit) {
         margin: 0;
       }
   
-      /* === 亮色模式 (保持清爽) === */
+      /* === 亮色模式 === */
       .light-mode {
         background-color: #f3f4f6;
         color: #1f293b;
@@ -736,48 +751,41 @@ function renderDashboard(hostname, password, ip, count, limit) {
           background: #fee2e2; color: #ef4444; border: 1px solid #fca5a5;
       }
   
-      /* === 暗黑模式 (还原截图 Deep Slate 风格) === */
+      /* === 暗黑模式 === */
       .dark-mode {
-        background-color: #0f172a; /* Slate 900 - 页面背景 */
+        background-color: #0f172a; 
         color: #e2e8f0;
       }
       .dark-mode .custom-content-wrapper {
-        background: transparent; /* 容器透明，突出内部卡片 */
+        background: transparent; 
         border: none;
         box-shadow: none;
       }
-      /* 卡片风格 - 对应截图中的深色块 */
       .dark-mode .section-box {
-        background-color: #1e293b; /* Slate 800 - 卡片背景 */
-        border: 1px solid #334155; /* Slate 700 - 微弱边框 */
+        background-color: #1e293b; 
+        border: 1px solid #334155; 
         box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.2);
       }
-      /* 输入框 - 对应截图3的深色底蓝边框风格 */
       .dark-mode input {
-        background-color: #0f172a; /* Slate 900 */
-        border: 1px solid #3b82f6; /* Blue 500 */
+        background-color: #0f172a;
+        border: 1px solid #3b82f6; 
         color: #f1f5f9;
       }
       .dark-mode input::placeholder {
         color: #64748b;
       }
-      /* 修复：暗黑模式代码块背景 (Dark Terminal Style) */
       .dark-mode .code-area {
-        background-color: #020617; /* Slate 950 (接近纯黑) */
+        background-color: #020617; 
         border: 1px solid #1e293b;
         color: #e2e8f0;
       }
-      
-      /* 核心修复：添加 select-text 允许选择 */
       .code-area, pre, .select-all {
           user-select: text !important;
           -webkit-user-select: text !important;
       }
-      
-      /* 重置按钮 - 对应截图2的白色底风格 */
       .dark-mode .reset-btn {
           background-color: white;
-          color: #ef4444; /* Red 500 */
+          color: #ef4444; 
           border: none;
           box-shadow: 0 2px 4px rgba(0,0,0,0.1);
       }
@@ -809,14 +817,30 @@ function renderDashboard(hostname, password, ip, count, limit) {
         transition: all 0.2s;
       }
   
-      .theme-toggle {
+      /* 顶部导航栏 (GitHub + 主题切换) */
+      .top-nav {
         position: fixed; top: 1.5rem; right: 1.5rem;
-        padding: 0.5rem; border-radius: 9999px;
-        background: rgba(255,255,255,0.1);
-        backdrop-filter: blur(4px);
-        cursor: pointer; z-index: 50;
-        border: 1px solid rgba(255,255,255,0.1);
+        z-index: 50;
+        display: flex; gap: 0.75rem;
       }
+      .nav-btn {
+        width: 2.5rem; height: 2.5rem;
+        border-radius: 9999px;
+        background: rgba(255,255,255,0.5); /* 亮色模式下 */
+        backdrop-filter: blur(4px);
+        border: 1px solid rgba(0,0,0,0.05);
+        display: flex; align-items: center; justify-content: center;
+        cursor: pointer; transition: all 0.2s;
+        color: #64748b; /* Slate 500 */
+      }
+      .nav-btn:hover { transform: scale(1.1); background: white; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1); }
+      
+      .dark-mode .nav-btn {
+        background: rgba(255,255,255,0.1);
+        border: 1px solid rgba(255,255,255,0.1);
+        color: #e2e8f0;
+      }
+      .dark-mode .nav-btn:hover { background: rgba(255,255,255,0.2); }
   
       /* Toast */
       .toast {
@@ -855,9 +879,16 @@ function renderDashboard(hostname, password, ip, count, limit) {
     </style>
   </head>
   <body class="light-mode">
-    <button onclick="toggleTheme()" class="theme-toggle text-gray-500 dark:text-gray-300">
-      <span class="sun text-xl">☀️</span><span class="moon hidden text-xl">🌙</span>
-    </button>
+    <div class="top-nav">
+       <a href="https://github.com/Kevin-YST-Du/Cloudflare-Accel" target="_blank" class="nav-btn" aria-label="GitHub Repository">
+         <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+             <path fill-rule="evenodd" d="M12 2C6.477 2 2 6.484 2 12.017c0 4.425 2.865 8.18 6.839 9.504.5.092.682-.217.682-.483 0-.237-.008-.868-.013-1.703-2.782.605-3.369-1.343-3.369-1.343-.454-1.158-1.11-1.466-1.11-1.466-.908-.62.069-.608.069-.608 1.003.07 1.531 1.032 1.531 1.032.892 1.53 2.341 1.088 2.91.832.092-.647.35-1.088.636-1.338-2.22-.253-4.555-1.113-4.555-4.951 0-1.093.39-1.988 1.029-2.688-.103-.253-.446-1.272.098-2.65 0 0 .84-.27 2.75 1.026A9.564 9.564 0 0112 6.844c.85.004 1.705.115 2.504.337 1.909-1.296 2.747-1.027 2.747-1.027.546 1.379.202 2.398.1 2.651.64.7 1.028 1.595 1.028 2.688 0 3.848-2.339 4.695-4.566 4.943.359.309.678.92.678 1.855 0 1.338-.012 2.419-.012 2.747 0 .268.18.58.688.482A10.019 10.019 0 0022 12.017C22 6.484 17.522 2 12 2z" clip-rule="evenodd"></path>
+         </svg>
+       </a>
+       <button onclick="toggleTheme()" class="nav-btn" aria-label="Toggle Theme">
+         <span class="sun text-lg">☀️</span><span class="moon hidden text-lg">🌙</span>
+       </button>
+    </div>
     
     <div class="custom-content-wrapper">
       <h1 class="text-3xl md:text-4xl font-extrabold text-center mb-8 tracking-tight">
