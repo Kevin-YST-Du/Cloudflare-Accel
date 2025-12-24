@@ -1,33 +1,36 @@
 /**
  * -----------------------------------------------------------------------------------------
- * Cloudflare Worker: 终极 Docker 代理 (GitHub UI 集成版)
+ * Cloudflare Worker: 终极 Docker 代理 (GitHub UI 集成版 + 管理员统计)
  * -----------------------------------------------------------------------------------------
- * * 核心功能：
- * 1. [强制中转] 拦截所有 S3 重定向，由 Worker 代为下载并流式回传，解决服务器连接 S3 超时(i/o timeout)问题。
- * 2. [流式传输] 使用 TransformStream 实现管道传输，支持 GB 级大文件，不受 Worker 内存限制。
- * 3. [UI 优化] 右上角增加 GitHub 仓库跳转按钮，优化黑夜模式体验。
- * * -----------------------------------------------------------------------------------------
+ * 核心功能：
+ * 1. [Docker加速] 自动识别多 Registry，解决 Docker Hub 限流。
+ * 2. [GitHub加速] 代理 GitHub 资源下载。
+ * 3. [S3 修复] 拦截 AWS/S3 重定向，解决 i/o timeout。
+ * 4. [访问控制] 密码保护、IP/地区限制、每日额度限制。
+ * 5. [管理面板] Dashboard 查看个人额度，管理员可查看全站 IP 统计。
+ * -----------------------------------------------------------------------------------------
  */
 
 // ==============================================================================
-// 1. 用户配置区域
+// 1. 用户配置区域 (可在此修改默认值，也可以在 Worker 环境变量中覆盖)
 // ==============================================================================
 const DEFAULT_CONFIG = {
-    PASSWORD: "123456",               // 访问密码
+    PASSWORD: "123456",               // 访问密码 (URL 前缀)
     MAX_REDIRECTS: 10,                // 最大重定向深度
     ENABLE_CACHE: true,               // 是否开启缓存
     CACHE_TTL: 3600,                  // 缓存时间 (秒)
-    BLACKLIST: "",                    // 域名黑名单
-    WHITELIST: "",                    // 域名白名单
-    ALLOW_IPS: "",                    // 允许访问的客户端 IP
-    ALLOW_COUNTRIES: "",              // 允许访问的国家代码
+    BLACKLIST: "",                    // 域名黑名单 (逗号分隔)
+    WHITELIST: "",                    // 域名白名单 (逗号分隔)
+    ALLOW_IPS: "",                    // 允许访问的客户端 IP (空则允许所有)
+    ALLOW_COUNTRIES: "",              // 允许访问的国家代码 (空则允许所有)
     
     // --- 统计配置 ---
     DAILY_LIMIT_COUNT: 50,            // 每日允许的最大请求次数
     
-    // 管理员 IP 列表 (逗号分隔)，用于手动重置
+    // 管理员 IP 列表 (换行或逗号分隔)，拥有重置额度和查看全站统计的权限
     ADMIN_IPS: `
     127.0.0.1
+    1.2.3.4
     `,                    
     // IP 白名单列表 (不消耗额度)
     IP_LIMIT_WHITELIST: `
@@ -63,9 +66,9 @@ const LIGHTNING_SVG = `<svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3
 
 export default {
     async fetch(request, env, ctx) {
-        // 辅助函数
+        // 辅助函数：解析环境变量中的列表
         const parseList = (envValue, defaultValue) => {
-            return (envValue || defaultValue).split(',').map(s => s.trim()).filter(s => s.length > 0);
+            return (envValue || defaultValue).split(/[\n,]/).map(s => s.trim()).filter(s => s.length > 0);
         };
 
         // 初始化配置
@@ -123,7 +126,7 @@ export default {
         }
 
         // --------------------------------------------------------------------------------
-        // 1. 安全检查
+        // 1. 安全检查 (IP/Country)
         // --------------------------------------------------------------------------------
         const clientCountry = request.cf ? request.cf.country : "XX";
         const hasIpConfig = CONFIG.ALLOW_IPS.length > 0;
@@ -139,14 +142,14 @@ export default {
         }
 
         // --------------------------------------------------------------------------------
-        // 2. 计费逻辑
+        // 2. 计费逻辑 (KV 计数)
         // --------------------------------------------------------------------------------
         const isWhitelisted = CONFIG.IP_LIMIT_WHITELIST.includes(clientIP);
         let usage = await getIpUsage(clientIP, env, CONFIG);
 
         const isHtmlRequest = acceptHeader.includes("text/html") && url.pathname.length > (CONFIG.PASSWORD.length + 2);
         
-        // 计费判定
+        // 计费判定：HTML页面访问不计费，Docker Manifest Pull 计费
         const isDockerCharge = isDockerV2 
             && isDockerClient 
             && url.pathname.includes("/manifests/") 
@@ -155,6 +158,7 @@ export default {
 
         let isCharged = false;
 
+        // 如果不是白名单IP，且符合计费条件
         if ((isHtmlRequest || isDockerCharge) && !isWhitelisted) {
             if (usage.count >= CONFIG.DAILY_LIMIT_COUNT) {
                 return new Response(`⚠️ 次数超限: IP ${clientIP} 今日已使用 ${usage.count}/${CONFIG.DAILY_LIMIT_COUNT}`, { status: 429 });
@@ -181,26 +185,42 @@ export default {
                 const path = url.pathname;
                 const match = path.match(/^\/([^/]+)(?:\/(.*))?$/);
                 
+                // 密码校验
                 if (!match || match[1] !== CONFIG.PASSWORD) {
                     return new Response("404 Not Found", { status: 404 });
                 }
 
                 const targetUrlStr = match[2];
 
+                // === 管理员功能：重置额度 ===
                 if (targetUrlStr === "reset") {
-                    if (CONFIG.ADMIN_IPS.length === 0) return new Response(JSON.stringify({ status: "error", message: "No Admin IPs" }), { status: 403 });
+                    if (CONFIG.ADMIN_IPS.length === 0) return new Response(JSON.stringify({ status: "error", message: "No Admin IPs Configured" }), { status: 403 });
                     if (!CONFIG.ADMIN_IPS.includes(clientIP)) return new Response(JSON.stringify({ status: "error", message: "Forbidden" }), { status: 403 });
                     await resetIpUsage(clientIP, env);
                     return new Response(JSON.stringify({ status: "success", message: "Reset OK" }), { status: 200 });
                 }
 
+                // === 管理员功能：全站统计 ===
+                if (targetUrlStr === "stats") {
+                    if (CONFIG.ADMIN_IPS.length === 0 || !CONFIG.ADMIN_IPS.includes(clientIP)) {
+                        return new Response(JSON.stringify({ status: "error", message: "Forbidden" }), { status: 403 });
+                    }
+                    const stats = await getAllIpStats(env);
+                    return new Response(JSON.stringify({ status: "success", data: stats }), {
+                        status: 200,
+                        headers: { "Content-Type": "application/json" }
+                    });
+                }
+
+                // === 渲染 Dashboard ===
                 if (!targetUrlStr) {
-                    return new Response(renderDashboard(url.hostname, CONFIG.PASSWORD, clientIP, usage.count, CONFIG.DAILY_LIMIT_COUNT), {
+                    return new Response(renderDashboard(url.hostname, CONFIG.PASSWORD, clientIP, usage.count, CONFIG.DAILY_LIMIT_COUNT, CONFIG.ADMIN_IPS), {
                         status: 200,
                         headers: { "Content-Type": "text/html;charset=UTF-8", "Cache-Control": "no-cache" }
                     });
                 }
 
+                // === 执行通用代理 ===
                 const proxyUrl = targetUrlStr + (url.search ? url.search : "");
                 const cacheKey = new Request(url.toString(), request);
                 const cache = caches.default;
@@ -219,6 +239,7 @@ export default {
                 response = await handleGeneralProxy(request, proxyUrl, CONFIG, cache, cacheKey, ctx);
             }
 
+            // 如果请求失败（且之前已计费），则退还额度
             if (isCharged && response && (response.status >= 500 || response.status === 429)) {
                 ctx.waitUntil(decrementIpUsage(clientIP, env));
             }
@@ -226,6 +247,7 @@ export default {
             return response;
 
         } catch (e) {
+            // 异常回退计费
             if (isCharged) await decrementIpUsage(clientIP, env);
             return new Response(JSON.stringify({ error: "Worker Error", message: e.message }), { status: 500 });
         }
@@ -373,7 +395,7 @@ async function handleDockerRequest(request, url) {
             }
         }
 
-        // 4. 强制流式代理下载
+        // 4. 强制流式代理下载 (处理 S3 跳转)
         if ([301, 302, 303, 307, 308].includes(response.status)) {
             const location = response.headers.get('Location');
             if (location) {
@@ -445,6 +467,7 @@ async function setDuplicateFlag(ip, path) {
     await cache.put(key, response);
 }
 
+// 获取单个 IP 使用量
 async function getIpUsage(ip, env, config) {
     if (!env.IP_LIMIT_KV) return { count: 0, allowed: true };
     const today = getBeijingDateString(); 
@@ -456,6 +479,7 @@ async function getIpUsage(ip, env, config) {
     } catch(e) { return { count: 0, allowed: true }; }
 }
 
+// 增加计数
 async function incrementIpUsage(ip, env) {
     if (!env.IP_LIMIT_KV) return;
     const today = getBeijingDateString(); 
@@ -467,6 +491,7 @@ async function incrementIpUsage(ip, env) {
     } catch(e) {}
 }
 
+// 减少计数 (失败返还)
 async function decrementIpUsage(ip, env) {
     if (!env.IP_LIMIT_KV) return;
     const today = getBeijingDateString(); 
@@ -480,6 +505,7 @@ async function decrementIpUsage(ip, env) {
     } catch(e) {}
 }
 
+// 重置单个 IP
 async function resetIpUsage(ip, env) {
     if (!env.IP_LIMIT_KV) return;
     const today = getBeijingDateString(); 
@@ -487,6 +513,39 @@ async function resetIpUsage(ip, env) {
     try {
         await env.IP_LIMIT_KV.delete(key);
     } catch(e) {}
+}
+
+// 获取所有 IP 统计数据 (新增功能)
+async function getAllIpStats(env) {
+    if (!env.IP_LIMIT_KV) return { totalRequests: 0, uniqueIps: 0, details: [] };
+    
+    const today = getBeijingDateString();
+    const prefix = `limit:`;
+    let totalRequests = 0;
+    let details = [];
+    
+    // KV List 操作，默认只列出1000条。如果IP非常多，可能不完全，但对于加速服务够用了。
+    let listResponse = await env.IP_LIMIT_KV.list({ prefix: prefix });
+    
+    for (const key of listResponse.keys) {
+        // key.name 格式为 limit:1.2.3.4:2025-12-24
+        const parts = key.name.split(':');
+        if (parts.length === 3 && parts[2] === today) {
+            const val = await env.IP_LIMIT_KV.get(key.name);
+            const count = parseInt(val || "0");
+            totalRequests += count;
+            details.push({ ip: parts[1], count: count });
+        }
+    }
+    
+    // 按使用量降序排列
+    details.sort((a, b) => b.count - a.count);
+    
+    return {
+        totalRequests,
+        uniqueIps: details.length,
+        details
+    };
 }
 
 // -----------------------------------------------------------------------------------------
@@ -687,10 +746,11 @@ class AttributeRewriter {
 }
 
 // -----------------------------------------------------------------------------------------
-// Dashboard 渲染函数 (包含 GitHub 图标)
+// Dashboard 渲染函数
 // -----------------------------------------------------------------------------------------
-function renderDashboard(hostname, password, ip, count, limit) {
+function renderDashboard(hostname, password, ip, count, limit, adminIps) {
     const percent = Math.min(Math.round((count / limit) * 100), 100);
+    const isAdmin = adminIps.includes(ip);
     
     return `
   <!DOCTYPE html>
@@ -911,12 +971,20 @@ function renderDashboard(hostname, password, ip, count, limit) {
               <div class="text-sm font-medium opacity-80">
                   今日额度: <span class="text-blue-600 dark:text-blue-400 font-bold">${count}</span> <span class="opacity-50">/ ${limit}</span>
               </div>
-              <button onclick="openModal()" class="reset-btn px-3 py-1.5 rounded-lg text-xs font-bold transition-transform hover:scale-105 flex items-center gap-1.5 shadow-sm">
-              <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path>
-              </svg>
-                  <span>重置额度</span>
-              </button>
+              <div class="flex gap-2">
+                <button onclick="openModal()" class="reset-btn px-3 py-1.5 rounded-lg text-xs font-bold transition-transform hover:scale-105 flex items-center gap-1.5 shadow-sm">
+                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+                </svg>
+                    <span>重置额度</span>
+                </button>
+                ${isAdmin ? `
+                <button onclick="viewAllStats()" class="px-3 py-1.5 rounded-lg text-xs font-bold bg-blue-100 text-blue-600 border border-blue-200 hover:bg-blue-200 transition-transform hover:scale-105 flex items-center gap-1.5 shadow-sm">
+                    <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"></path></svg>
+                    <span>全站统计</span>
+                </button>
+                ` : ''}
+              </div>
           </div>
         </div>
         
@@ -927,6 +995,15 @@ function renderDashboard(hostname, password, ip, count, limit) {
           <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
           失败自动退还额度 · 短时重复请求不扣费。（10s）
         </p>
+
+        <div id="stats-panel" class="hidden mt-4 p-4 rounded-lg bg-gray-50 dark:bg-slate-800/50 border border-gray-200 dark:border-slate-700">
+            <div class="flex justify-between mb-2">
+                <h4 class="text-xs font-bold opacity-70 uppercase tracking-wider">今日全站概况</h4>
+                <span id="stats-summary" class="text-xs font-mono text-blue-600 dark:text-blue-400"></span>
+            </div>
+            <div id="stats-list" class="max-h-40 overflow-y-auto text-[10px] font-mono divide-y divide-gray-100 dark:divide-slate-700 pr-2">
+                </div>
+        </div>
       </div>
   
       <div class="section-box">
@@ -1013,7 +1090,7 @@ function renderDashboard(hostname, password, ip, count, limit) {
             </div>
             <h3 class="text-lg font-bold mb-2">确认重置额度？</h3>
             <p class="text-sm opacity-70 mb-6 px-4">
-                此操作仅限管理员 (IP: ${ip})。重置后不可撤销。
+               此操作仅限管理员 (IP: ${ip})。重置后不可撤销。
             </p>
             <div class="flex gap-3">
                <button onclick="closeModal()" class="flex-1 px-4 py-2.5 bg-gray-100 hover:bg-gray-200 dark:bg-slate-700 dark:hover:bg-slate-600 rounded-lg text-sm font-bold transition">取消</button>
@@ -1114,6 +1191,39 @@ function renderDashboard(hostname, password, ip, count, limit) {
           showToast('❌ 网络错误', true);
         }
       }
+
+      async function viewAllStats() {
+            const panel = document.getElementById('stats-panel');
+            if (!panel.classList.contains('hidden')) {
+                panel.classList.add('hidden');
+                return;
+            }
+
+            try {
+                showToast('正在获取全站数据...');
+                const res = await fetch('/' + WORKER_PASSWORD + '/stats');
+                const result = await res.json();
+                
+                if (res.ok && result.status === "success") {
+                    const { totalRequests, uniqueIps, details } = result.data;
+                    document.getElementById('stats-summary').textContent = \`总请求: \${totalRequests} | 活跃IP: \${uniqueIps}\`;
+                    
+                    const listContainer = document.getElementById('stats-list');
+                    listContainer.innerHTML = details.map(item => \`
+                        <div class="flex justify-between py-1.5 hover:bg-gray-100 dark:hover:bg-slate-700/50 px-2 rounded cursor-default">
+                            <span class="\${item.ip === '${ip}' ? 'text-blue-500 font-bold' : 'opacity-70'}">\${item.ip}</span>
+                            <span class="font-bold">\${item.count} 次</span>
+                        </div>
+                    \`).join('');
+                    
+                    panel.classList.remove('hidden');
+                } else {
+                    showToast('❌ 获取失败: ' + (result.message || '权限不足'), true);
+                }
+            } catch (e) {
+                showToast('❌ 网络错误', true);
+            }
+        }
     </script>
   </body>
   </html>
