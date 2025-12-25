@@ -1,13 +1,13 @@
 /**
  * -----------------------------------------------------------------------------------------
- * Cloudflare Worker: 终极 Docker 代理 (高性能版 v2.8 - 交互修复版)
+ * Cloudflare Worker: 终极 Docker & Linux 代理 (高性能版 v3.3 - 添加 RedHat/Rocky/Alma 支持)
  * -----------------------------------------------------------------------------------------
  * 核心功能：
  * 1. Docker Hub/GHCR 等镜像仓库加速下载。
  * 2. 智能处理 Docker 的 library/ 命名空间补全。
- * 3. 集成 KV 存储进行每日 IP 请求限额控制。
- * 4. 提供 Web Dashboard 查看使用情况和生成加速命令。
- * 5. 提供管理员功能：重置单 IP 额度、清空全站统计。
+ * 3. Linux 软件源加速，新增对 debian-security 的支持。
+ * 4. 集成 KV 存储进行每日 IP 请求限额控制。
+ * 5. Web Dashboard (修复了交互 Bug，增强了 Linux 换源脚本的兼容性)。
  * -----------------------------------------------------------------------------------------
  */
 
@@ -49,7 +49,7 @@ const DOCKER_REGISTRIES = [
     'k8s.gcr.io', 'registry.k8s.io', 'ghcr.io', 'docker.cloudsmith.io'
 ];
 
-// 简写映射：将 registry 别名映射到完整的 URL
+// Docker 简写映射：将 registry 别名映射到完整的 URL
 const REGISTRY_MAP = {
     'ghcr.io': 'https://ghcr.io',
     'quay.io': 'https://quay.io',
@@ -58,6 +58,22 @@ const REGISTRY_MAP = {
     'registry.k8s.io': 'https://registry.k8s.io',
     'docker.cloudsmith.io': 'https://docker.cloudsmith.io',
     'nvcr.io': 'https://nvcr.io'
+};
+
+// [新增] Linux 软件源镜像映射 (修复 Security 源 404 问题，添加 RedHat 系支持)
+const LINUX_MIRRORS = {
+    'ubuntu': 'http://archive.ubuntu.com/ubuntu',
+    'ubuntu-security': 'http://security.ubuntu.com/ubuntu', // Ubuntu 安全源
+    'debian': 'http://deb.debian.org/debian',
+    'debian-security': 'http://security.debian.org/debian-security', // Debian 安全源
+    'centos': 'https://vault.centos.org',
+    'centos-stream': 'http://mirror.stream.centos.org',
+    'rockylinux': 'https://download.rockylinux.org/pub/rocky', // Rocky Linux (RedHat 替代)
+    'almalinux': 'https://repo.almalinux.org/almalinux', // AlmaLinux (RedHat 替代)
+    'fedora': 'https://download.fedoraproject.org/pub/fedora/linux', // Fedora
+    'alpine': 'http://dl-cdn.alpinelinux.org/alpine',
+    'kali': 'http://http.kali.org/kali',
+    'archlinux': 'https://geo.mirror.pkgbuild.com'
 };
 
 // 网站图标 (闪电 SVG)
@@ -172,38 +188,51 @@ export default {
                     return new Response("404 Not Found", { status: 404 });
                 }
 
-                const targetUrlStr = match[2];
+                const subPath = match[2];
 
                 // 2.5.1 管理员命令 API: 重置单 IP
-                if (targetUrlStr === "reset") {
+                if (subPath === "reset") {
                     if (!CONFIG.ADMIN_IPS.includes(clientIP)) return new Response("Forbidden", { status: 403 });
                     ctx.waitUntil(resetIpUsage(clientIP, env)); // 异步重置 KV
                     return new Response(JSON.stringify({ status: "success" }), { status: 200 });
                 }
 
                 // 2.5.2 管理员命令 API: 清空全站数据 (新增)
-                if (targetUrlStr === "reset-all") {
+                if (subPath === "reset-all") {
                     if (!CONFIG.ADMIN_IPS.includes(clientIP)) return new Response("Forbidden", { status: 403 });
                     ctx.waitUntil(resetAllIpStats(env)); // 调用清空所有函数
                     return new Response(JSON.stringify({ status: "success" }), { status: 200 });
                 }
 
                 // 2.5.3 管理员命令 API: 获取统计
-                if (targetUrlStr === "stats") {
+                if (subPath === "stats") {
                     if (!CONFIG.ADMIN_IPS.includes(clientIP)) return new Response("Forbidden", { status: 403 });
                     const stats = await getAllIpStats(env);
                     return new Response(JSON.stringify({ status: "success", data: stats }), { status: 200 });
                 }
 
                 // 2.5.4 如果没有目标 URL，显示 Dashboard
-                if (!targetUrlStr) {
+                if (!subPath) {
                     return new Response(renderDashboard(url.hostname, CONFIG.PASSWORD, clientIP, currentUsage, CONFIG.DAILY_LIMIT_COUNT, CONFIG.ADMIN_IPS), {
                         status: 200, headers: { "Content-Type": "text/html;charset=UTF-8" }
                     });
                 }
 
-                // 2.5.5 通用文件代理 (如 GitHub 文件加速)
-                response = await handleGeneralProxy(request, targetUrlStr + (url.search || ""), CONFIG, ctx);
+                // 2.5.5 [新增] Linux 软件源加速路由识别
+                // 核心修复：Linux 镜像匹配逻辑
+                // 优先匹配最长的前缀，以区分 debian 和 debian-security
+                const sortedMirrors = Object.keys(LINUX_MIRRORS).sort((a, b) => b.length - a.length);
+                const linuxDistro = sortedMirrors.find(k => subPath.startsWith(k + '/') || subPath === k);
+
+                if (linuxDistro) {
+                    // -> 进入 Linux 软件源加速逻辑 (支持 Range/Streaming)
+                    const realPath = subPath.replace(linuxDistro, '').replace(/^\//, ''); // 移除前缀
+                    const upstreamBase = LINUX_MIRRORS[linuxDistro];
+                    response = await handleLinuxMirrorRequest(request, upstreamBase, realPath);
+                } else {
+                    // 2.5.6 通用文件代理 (如 GitHub 文件加速)
+                    response = await handleGeneralProxy(request, subPath + (url.search || ""), CONFIG, ctx);
+                }
             }
 
             // --- 2.6 异步计费执行 ---
@@ -221,9 +250,10 @@ export default {
 };
 
 // ==============================================================================
-// 3. 鉴权处理逻辑 (Token Handler)
+// 3. 辅助功能函数 (Token, Docker, Linux, KV)
 // ==============================================================================
 
+// 3.1 鉴权处理逻辑 (Token Handler)
 async function handleTokenRequest(request, url) {
     const scope = url.searchParams.get('scope');
     let upstreamAuthUrl = 'https://auth.docker.io/token'; 
@@ -269,10 +299,7 @@ async function handleTokenRequest(request, url) {
     }));
 }
 
-// ==============================================================================
-// 4. Docker 核心处理逻辑 (Docker V2 Handler)
-// ==============================================================================
-
+// 3.2 Docker 核心处理逻辑 (Docker V2 Handler)
 async function handleDockerRequest(request, url) {
     // 移除路径中的 /v2/ 前缀
     let path = url.pathname.replace(/^\/v2\//, '');
@@ -359,14 +386,19 @@ function rewriteAuthHeader(response, workerOrigin) {
     return newResp;
 }
 
+// 3.3 Docker Blob 代理 (支持 Range)
 async function handleBlobProxy(targetUrl, originalRequest) {
     const newHeaders = new Headers();
     newHeaders.set('User-Agent', 'Docker-Client/24.0.5 (linux)');
-    // 支持断点续传
+    // 支持断点续传: 转发 Range 头
     const range = originalRequest.headers.get('Range');
     if (range) newHeaders.set('Range', range);
 
-    const upstreamResponse = await fetch(targetUrl, { method: 'GET', headers: newHeaders });
+    // 发起请求，注意这里直接 fetch 会自动处理流式响应
+    const upstreamResponse = await fetch(targetUrl, { 
+        method: 'GET', 
+        headers: newHeaders 
+    });
     
     const proxyHeaders = new Headers(upstreamResponse.headers);
     proxyHeaders.set('Access-Control-Allow-Origin', '*');
@@ -375,16 +407,14 @@ async function handleBlobProxy(targetUrl, originalRequest) {
     proxyHeaders.delete('Content-Encoding'); 
     proxyHeaders.delete('Transfer-Encoding');
 
+    // 返回流式响应，支持 206 Partial Content
     return new Response(upstreamResponse.body, {
         status: upstreamResponse.status,
         headers: proxyHeaders
     });
 }
 
-// ==============================================================================
-// 5. KV 计数与 Cache 工具 (Rate Limiting & Utils)
-// ==============================================================================
-
+// 3.4 KV 计数与 Cache 工具 (Rate Limiting & Utils)
 function getDate() { return new Date(new Date().getTime() + 28800000).toISOString().split('T')[0]; } // UTC+8 日期
 
 // 使用 Cache API 实现短时间内的请求去重 (防抖)
@@ -447,10 +477,62 @@ async function getAllIpStats(env) {
     return { totalRequests: total, uniqueIps: details.length, details };
 }
 
-// ==============================================================================
-// 6. 通用代理逻辑 (General Proxy Handler)
-// ==============================================================================
+// 3.5 [新增] Linux 软件源加速逻辑 (Streaming & Range)
+async function handleLinuxMirrorRequest(request, upstreamBase, path) {
+    // 构造上游 URL (例如: http://archive.ubuntu.com/ubuntu/dists/jammy/Release)
+    // 确保 path 开头有 slash
+    const targetUrl = upstreamBase.endsWith('/') 
+        ? upstreamBase + path 
+        : upstreamBase + '/' + path;
 
+    const newHeaders = new Headers(request.headers);
+    // 移除 Cloudflare 特有头，防止上游误判
+    newHeaders.delete('Cf-Connecting-Ip');
+    newHeaders.delete('Cf-Worker');
+    newHeaders.delete('Host'); // Let fetch set the host
+    
+    // [关键功能] 支持 Range 请求 (断点续传/多线程下载)
+    // 客户端发来的 Range 头 (如 bytes=0-1023) 会被转发给上游
+    const range = request.headers.get('Range');
+    if (range) {
+        newHeaders.set('Range', range);
+        // console.log(`[Linux Proxy] Range Request: ${range} -> ${targetUrl}`);
+    }
+
+    try {
+        const response = await fetch(targetUrl, {
+            method: request.method,
+            headers: newHeaders,
+            redirect: 'follow' // Linux 源通常允许重定向，我们直接跟随
+        });
+
+        // 构造响应头
+        const responseHeaders = new Headers(response.headers);
+        responseHeaders.set('Access-Control-Allow-Origin', '*');
+        
+        // 确保 Content-Range, Content-Length, Accept-Ranges 被正确透传
+        // Cloudflare Worker 的 fetch 通常会自动处理这些，但显式保留是个好习惯
+        if (response.headers.has('Content-Range')) {
+            responseHeaders.set('Content-Range', response.headers.get('Content-Range'));
+        }
+        if (response.headers.has('Accept-Ranges')) {
+            responseHeaders.set('Accept-Ranges', response.headers.get('Accept-Ranges'));
+        }
+
+        // 返回 Response 对象
+        // response.body 是 ReadableStream，这实现了“流式传输”
+        // 意味着 Worker 不会缓存整个文件，而是收到一点转发一点，极大降低内存占用并加速大文件下载
+        return new Response(response.body, {
+            status: response.status, // 200 或 206 (Partial Content)
+            headers: responseHeaders
+        });
+
+    } catch (e) {
+        return new Response(`Linux Mirror Proxy Error: ${e.message}`, { status: 502 });
+    }
+}
+
+// 3.6 通用代理逻辑 (General Proxy Handler)
 async function handleGeneralProxy(request, targetUrlStr, CONFIG, ctx) {
     let currentUrlStr = targetUrlStr;
     // 补全协议头
@@ -475,6 +557,10 @@ async function handleGeneralProxy(request, targetUrlStr, CONFIG, ctx) {
             newHeaders.set("Origin", currentTargetUrl.origin);
             if (!newHeaders.get("User-Agent")) newHeaders.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
             
+            // [修复] 通用代理也应该支持 Range，方便下载 GitHub Releases 等大文件
+            const range = request.headers.get('Range');
+            if (range) newHeaders.set('Range', range);
+
             newHeaders.delete("Cf-Worker"); newHeaders.delete("Cf-Ray"); newHeaders.delete("Cookie"); newHeaders.delete("X-Forwarded-For");
 
             const response = await fetch(currentUrlStr, {
@@ -532,16 +618,15 @@ class AttributeRewriter {
 }
 
 // ==============================================================================
-// 7. Dashboard 渲染 (已修复交互问题)
+// 4. Dashboard 渲染
 // ==============================================================================
 
 function renderDashboard(hostname, password, ip, count, limit, adminIps) {
     const percent = Math.min(Math.round((count / limit) * 100), 100);
     const isAdmin = adminIps.includes(ip);
-    
-    // 关键修复：在生成 HTML 之前，确保所有内嵌变量安全。
-    // 使用纯字符串拼接而非模板字符串来构建客户端脚本，彻底避免 SyntaxError。
-    
+    const linuxMirrorsJson = JSON.stringify(Object.keys(LINUX_MIRRORS));
+
+    // 注意：这里的 HTML 代码使用了 \\n 来防止 JS 语法错误
     return `
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -550,18 +635,7 @@ function renderDashboard(hostname, password, ip, count, limit, adminIps) {
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <title>Cloudflare 加速通道</title>
     <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,${encodeURIComponent(LIGHTNING_SVG)}">
-    
-    <script>
-      (function() {
-        const originalWarn = console.warn;
-        console.warn = function(...args) {
-          if (args[0] && typeof args[0] === 'string' && args[0].includes('cdn.tailwindcss.com')) return;
-          originalWarn.apply(console, args);
-        };
-      })();
-    </script>
     <script src="https://cdn.tailwindcss.com"></script>
-  
     <style>
       /* --- CSS 样式 --- */
       /* ==================== 全局设置 ==================== */
@@ -590,7 +664,7 @@ function renderDashboard(hostname, password, ip, count, limit, adminIps) {
           background: #f8fafc; 
           border: 1px solid #e2e8f0; 
       }
-      .light-mode input { 
+      .light-mode input, .light-mode select { 
           background: white; 
           border: 1px solid #d1d5db; 
           color: #1f293b; 
@@ -621,7 +695,7 @@ function renderDashboard(hostname, password, ip, count, limit, adminIps) {
           border: 1px solid #334155; 
           box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.2); 
       }
-      .dark-mode input { 
+      .dark-mode input, .dark-mode select { 
           background-color: #0f172a; 
           border: 1px solid #3b82f6; 
           color: #f1f5f9; 
@@ -680,6 +754,8 @@ function renderDashboard(hostname, password, ip, count, limit, adminIps) {
           padding: 2rem; 
           margin-bottom: 1.5rem; 
           transition: all 0.2s; 
+          position: relative;
+          z-index: 1;
       }
 
       /* ==================== 顶部导航 ==================== */
@@ -743,15 +819,15 @@ function renderDashboard(hostname, password, ip, count, limit, adminIps) {
           opacity: 1; 
           transform: translateX(-50%) translateY(0); 
       }
-      input { 
+      input, select { 
           outline: none; 
           transition: all 0.2s; 
       }
-      input:focus { 
+      input:focus, select:focus { 
           ring: 2px #3b82f6; 
           ring-offset-2px; 
       }
-      .dark-mode input:focus { 
+      .dark-mode input:focus, .dark-mode select:focus { 
           ring: 0; 
           border-color: #60a5fa; 
           box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.3); 
@@ -810,6 +886,7 @@ function renderDashboard(hostname, password, ip, count, limit, adminIps) {
         <span class="bg-clip-text text-transparent bg-gradient-to-r from-blue-600 to-indigo-600 dark:from-blue-400 dark:to-indigo-400">Cloudflare 加速通道</span>
       </h1>
       
+      <!-- IP 信息面板 -->
       <div class="section-box relative">
         <div class="flex flex-col md:flex-row justify-between items-center mb-4 gap-4">
           <div class="flex items-center gap-3">
@@ -831,7 +908,7 @@ function renderDashboard(hostname, password, ip, count, limit, adminIps) {
                 </button>
                 ${isAdmin ? `
                 <button onclick="viewAllStats()" class="px-3 py-1.5 rounded-lg text-xs font-bold bg-blue-100 text-blue-600 border border-blue-200 hover:bg-blue-200 transition-transform hover:scale-105 flex items-center gap-1.5 shadow-sm">
-                    <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"></path></svg>
+                    <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 01-2 2h-2a2 2 0 01-2-2z"></path></svg>
                     <span>全站统计</span>
                 </button>
                 ` : ''}
@@ -865,7 +942,8 @@ function renderDashboard(hostname, password, ip, count, limit, adminIps) {
             </div>
         </div>
       </div>
-  
+      
+      <!-- GitHub 文件加速 -->
       <div class="section-box">
         <h2 class="text-lg font-bold mb-4 flex items-center gap-2 opacity-90">
           <svg class="w-5 h-5 text-gray-700 dark:text-gray-300" fill="currentColor" viewBox="0 0 24 24"><path d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z"/></svg>
@@ -878,7 +956,6 @@ function renderDashboard(hostname, password, ip, count, limit, adminIps) {
               获取链接
           </button>
         </div>
-        
         <div id="github-result-box" class="hidden mt-5">
           <div class="p-4 bg-emerald-50 dark:bg-emerald-900/20 border border-emerald-100 dark:border-emerald-800 rounded-lg mb-3">
                <p id="github-result" class="text-emerald-700 dark:text-emerald-400 font-mono text-xs break-all select-all"></p>
@@ -889,7 +966,8 @@ function renderDashboard(hostname, password, ip, count, limit, adminIps) {
           </div>
         </div>
       </div>
-  
+
+      <!-- Docker 镜像加速 -->
       <div class="section-box">
         <h2 class="text-lg font-bold mb-4 flex items-center gap-2 opacity-90">
           <span class="text-xl">🐳</span> Docker 镜像加速
@@ -901,7 +979,6 @@ function renderDashboard(hostname, password, ip, count, limit, adminIps) {
                获取命令
           </button>
         </div>
-        
         <div id="docker-result-box" class="hidden mt-5">
            <div class="p-4 bg-emerald-50 dark:bg-emerald-900/20 border border-emerald-100 dark:border-emerald-800 rounded-lg mb-3">
                <p id="docker-result" class="text-emerald-700 dark:text-emerald-400 font-mono text-xs break-all select-all"></p>
@@ -909,24 +986,47 @@ function renderDashboard(hostname, password, ip, count, limit, adminIps) {
           <button onclick="copyDockerCommand()" class="w-full bg-gray-100 dark:bg-slate-700 hover:bg-gray-200 dark:hover:bg-slate-600 text-gray-700 dark:text-gray-200 py-2.5 rounded-lg text-xs font-bold transition">一键复制命令</button>
         </div>
       </div>
+
+      <!-- Linux 软件源加速 -->
+      <div class="section-box">
+        <h2 class="text-lg font-bold mb-4 flex items-center gap-2 opacity-90">
+          <span class="text-xl">🐧</span> Linux 软件源加速 (Range 支持)
+        </h2>
+        <div class="flex flex-responsive gap-3">
+          <select id="linux-distro" class="flex-none p-3.5 rounded-lg text-sm bg-gray-50 dark:bg-slate-800 border-r-8 border-transparent outline-none">
+             <!-- Options will be populated by JS -->
+          </select>
+          <button onclick="generateLinuxCommand()" class="bg-orange-600 hover:bg-orange-700 text-white px-6 py-3.5 rounded-lg transition font-bold text-sm shadow-md whitespace-nowrap flex items-center justify-center gap-1 w-full md:w-auto">
+              <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/></svg>
+              生成换源命令
+          </button>
+        </div>
+        <div id="linux-result-box" class="hidden mt-5">
+            <p class="text-xs opacity-70 mb-2">使用以下命令一键替换：</p>
+            <div class="p-4 bg-orange-50 dark:bg-orange-900/20 border border-orange-100 dark:border-orange-800 rounded-lg mb-3">
+                <p id="linux-result" class="text-orange-700 dark:text-orange-400 font-mono text-xs break-all select-all"></p>
+            </div>
+            <p class="text-[10px] opacity-60 mt-2 mb-2">
+                * 注意：脚本仅替换官方默认源。若您已使用其他镜像源（如阿里云），请手动编辑文件。
+            </p>
+            <button onclick="copyLinuxCommand()" class="w-full bg-gray-100 dark:bg-slate-700 hover:bg-gray-200 dark:hover:bg-slate-600 text-gray-700 dark:text-gray-200 py-2.5 rounded-lg text-xs font-bold transition">复制命令</button>
+        </div>
+      </div>
   
+      <!-- Daemon.json 配置 -->
       <div class="section-box">
           <h2 class="text-lg font-bold mb-4 flex items-center gap-2 opacity-90">
               <svg class="w-5 h-5 text-purple-600 dark:text-purple-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/></svg>
               镜像源配置 (Daemon.json)
           </h2>
-          
           <div class="code-area rounded-lg p-4 overflow-x-auto text-sm">
               <p class="text-gray-500 dark:text-gray-500 mb-1"># 1. 编辑配置文件</p>
               <p class="font-mono text-blue-600 dark:text-blue-400 font-bold mb-4">nano /etc/docker/daemon.json</p>
-              
               <p class="text-gray-500 dark:text-gray-500 mb-1"># 2. 填入以下内容</p>
               <pre id="daemon-json-content" class="font-mono text-emerald-600 dark:text-emerald-400 mb-4 bg-transparent p-0 border-0"></pre>
-              
               <p class="text-gray-500 dark:text-gray-500 mb-1"># 3. 重启 Docker</p>
               <p class="font-mono text-blue-600 dark:text-blue-400 font-bold">sudo systemctl daemon-reload && sudo systemctl restart docker</p>
           </div>
-          
           <button onclick="copyDaemonJson()" class="mt-4 px-4 py-2 bg-gray-800 dark:bg-white hover:bg-black dark:hover:bg-gray-200 text-white dark:text-black rounded-lg text-xs font-bold transition shadow-sm flex items-center gap-2">
               <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 5H6a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2v-1M8 5a2 2 0 002 2h2a2 2 0 002-2M8 5a2 2 0 012-2h2a2 2 0 012 2m0 0h2a2 2 0 012 2v3m2 4H10m0 0l3-3m-3 3l3 3"/></svg>
               复制配置
@@ -934,12 +1034,8 @@ function renderDashboard(hostname, password, ip, count, limit, adminIps) {
       </div>
   
       <footer class="mt-12 text-center pb-8">
-            <a href="https://github.com/Kevin-YST-Du/Cloudflare-Accel" 
-                target="_blank" 
-                class="text-[10px] text-blue-600 dark:text-blue-400 uppercase tracking-widest font-bold opacity-80 hover:opacity-100 hover:underline transition-all">
-        Powered by Kevin-YST-Du/Cloudflare-Accel
-    </a>
-</footer>
+            <a href="https://github.com/Kevin-YST-Du/Cloudflare-Accel" target="_blank" class="text-[10px] text-blue-600 dark:text-blue-400 uppercase tracking-widest font-bold opacity-80 hover:opacity-100 hover:underline transition-all">Powered by Kevin-YST-Du/Cloudflare-Accel</a>
+      </footer>
     </div>
   
     <div id="confirmModal" class="modal-overlay">
@@ -949,9 +1045,7 @@ function renderDashboard(hostname, password, ip, count, limit, adminIps) {
                <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/></svg>
             </div>
             <h3 class="text-lg font-bold mb-2">确认重置额度？</h3>
-            <p class="text-sm opacity-70 mb-6 px-4">
-                此操作仅限管理员 (IP: ${ip})。重置后不可撤销。
-            </p>
+            <p class="text-sm opacity-70 mb-6 px-4">此操作仅限管理员 (IP: ${ip})。重置后不可撤销。</p>
             <div class="flex gap-3">
                <button onclick="closeModal()" class="flex-1 px-4 py-2.5 bg-gray-100 hover:bg-gray-200 dark:bg-slate-700 dark:hover:bg-slate-600 rounded-lg text-sm font-bold transition">取消</button>
                <button onclick="confirmReset()" class="flex-1 px-4 py-2.5 bg-red-500 hover:bg-red-600 text-white rounded-lg text-sm font-bold transition shadow-lg shadow-red-500/30">确定重置</button>
@@ -959,26 +1053,34 @@ function renderDashboard(hostname, password, ip, count, limit, adminIps) {
          </div>
       </div>
     </div>
-  
     <div id="toast" class="toast bg-slate-800 text-white"></div>
-  
     <script>
-      // 将服务端注入变量包裹在 try-catch 中，防止意外的字符导致整个脚本崩溃
       try {
           window.CURRENT_DOMAIN = window.location.hostname;
           window.WORKER_PASSWORD = "${password}"; 
           window.CURRENT_CLIENT_IP = "${ip}";
+          window.LINUX_MIRRORS = ${linuxMirrorsJson};
           
           let githubAcceleratedUrl = '';
           let dockerCommand = '';
+          let linuxCommand = '';
           
-          // JSON Config
+          const linuxSelect = document.getElementById('linux-distro');
+          if (linuxSelect) {
+              const mainMirrors = window.LINUX_MIRRORS.filter(m => !m.includes('-security'));
+              mainMirrors.forEach(distro => {
+                  const opt = document.createElement('option');
+                  opt.value = distro;
+                  opt.textContent = distro.charAt(0).toUpperCase() + distro.slice(1);
+                  linuxSelect.appendChild(opt);
+              });
+          }
+          
           const daemonJsonObj = { "registry-mirrors": ["https://" + window.CURRENT_DOMAIN] };
           const daemonJsonStr = JSON.stringify(daemonJsonObj, null, 2);
           const daemonEl = document.getElementById('daemon-json-content');
           if (daemonEl) daemonEl.textContent = daemonJsonStr;
   
-          // Theme Toggle
           window.toggleTheme = function() {
             try {
                 const body = document.body;
@@ -996,11 +1098,8 @@ function renderDashboard(hostname, password, ip, count, limit, adminIps) {
             } catch(e) { console.error('Theme toggle error:', e); }
           }
           
-          try {
-              if (localStorage.getItem('theme') === 'dark') window.toggleTheme();
-          } catch(e) {}
+          try { if (localStorage.getItem('theme') === 'dark') window.toggleTheme(); } catch(e) {}
   
-          // Toast
           window.showToast = function(message, isError = false) {
             const toast = document.getElementById('toast');
             toast.innerHTML = message;
@@ -1008,11 +1107,9 @@ function renderDashboard(hostname, password, ip, count, limit, adminIps) {
             setTimeout(() => toast.classList.remove('show'), 3000);
           }
   
-          // Modal
           window.openModal = function() { document.getElementById('confirmModal').classList.add('open'); }
           window.closeModal = function() { document.getElementById('confirmModal').classList.remove('open'); }
   
-          // Copy
           window.copyToClipboard = function(text) {
             if (navigator.clipboard && window.isSecureContext) { return navigator.clipboard.writeText(text); }
             const textArea = document.createElement("textarea");
@@ -1022,7 +1119,6 @@ function renderDashboard(hostname, password, ip, count, limit, adminIps) {
             catch (err) { document.body.removeChild(textArea); return Promise.reject(err); }
           }
   
-          // Logic
           window.convertGithubUrl = function() {
             let input = document.getElementById('github-url').value.trim();
             if (!input) return window.showToast('❌ 请输入链接', true);
@@ -1044,6 +1140,51 @@ function renderDashboard(hostname, password, ip, count, limit, adminIps) {
             window.copyToClipboard(dockerCommand).then(() => window.showToast('✅ 已复制'));
           }
           window.copyDockerCommand = function() { window.copyToClipboard(dockerCommand).then(() => window.showToast('✅ 已复制')); }
+          
+          window.generateLinuxCommand = function() {
+              const distro = document.getElementById('linux-distro').value;
+              const baseUrl = window.location.origin + '/' + window.WORKER_PASSWORD + '/' + distro + '/';
+              const securityUrl = window.location.origin + '/' + window.WORKER_PASSWORD + '/' + distro + '-security/';
+              
+              if (distro === 'ubuntu') {
+                  linuxCommand = 'sudo sed -i "s|http://archive.ubuntu.com/ubuntu/|' + baseUrl + '|g" /etc/apt/sources.list && ' +
+                                 'sudo sed -i "s|https://archive.ubuntu.com/ubuntu/|' + baseUrl + '|g" /etc/apt/sources.list && ' +
+                                 'sudo sed -i "s|http://security.ubuntu.com/ubuntu/|' + securityUrl + '|g" /etc/apt/sources.list && ' +
+                                 'sudo sed -i "s|https://security.ubuntu.com/ubuntu/|' + securityUrl + '|g" /etc/apt/sources.list';
+              } else if (distro === 'debian') {
+                  linuxCommand = 'sudo sed -i "s|http://deb.debian.org/debian|' + baseUrl + '|g" /etc/apt/sources.list && ' +
+                                 'sudo sed -i "s|https://deb.debian.org/debian|' + baseUrl + '|g" /etc/apt/sources.list && ' +
+                                 'sudo sed -i "s|http://security.debian.org/debian-security|' + securityUrl + '|g" /etc/apt/sources.list && ' +
+                                 'sudo sed -i "s|https://security.debian.org/debian-security|' + securityUrl + '|g" /etc/apt/sources.list';
+              } else if (distro === 'centos') {
+                  linuxCommand = 'sudo sed -i "s/mirrorlist/#mirrorlist/g" /etc/yum.repos.d/*.repo && ' +
+                                 'sudo sed -i "s|#baseurl=http://mirror.centos.org|baseurl=' + baseUrl + '|g" /etc/yum.repos.d/*.repo && ' +
+                                 'sudo sed -i "s|baseurl=http://mirror.centos.org|baseurl=' + baseUrl + '|g" /etc/yum.repos.d/*.repo';
+              } else if (distro === 'rockylinux') {
+                  linuxCommand = 'sudo sed -i "s/mirrorlist/#mirrorlist/g" /etc/yum.repos.d/rocky*.repo && ' +
+                                 'sudo sed -i "s|#baseurl=http://dl.rockylinux.org/$contentdir|baseurl=' + baseUrl + '|g" /etc/yum.repos.d/rocky*.repo && ' +
+                                 'sudo sed -i "s|baseurl=http://dl.rockylinux.org/$contentdir|baseurl=' + baseUrl + '|g" /etc/yum.repos.d/rocky*.repo';
+              } else if (distro === 'almalinux') {
+                  linuxCommand = 'sudo sed -i "s/mirrorlist/#mirrorlist/g" /etc/yum.repos.d/almalinux*.repo && ' +
+                                 'sudo sed -i "s|#baseurl=https://repo.almalinux.org/almalinux|baseurl=' + baseUrl + '|g" /etc/yum.repos.d/almalinux*.repo && ' +
+                                 'sudo sed -i "s|baseurl=https://repo.almalinux.org/almalinux|baseurl=' + baseUrl + '|g" /etc/yum.repos.d/almalinux*.repo';
+              } else if (distro === 'fedora') {
+                  linuxCommand = 'sudo sed -i "s/metalink/#metalink/g" /etc/yum.repos.d/fedora*.repo && ' +
+                                 'sudo sed -i "s|#baseurl=http://download.example/pub/fedora/linux|baseurl=' + baseUrl + '|g" /etc/yum.repos.d/fedora*.repo && ' +
+                                 'sudo sed -i "s|baseurl=http://download.example/pub/fedora/linux|baseurl=' + baseUrl + '|g" /etc/yum.repos.d/fedora*.repo';
+              } else if (distro === 'alpine') {
+                  linuxCommand = 'sudo sed -i "s|http://dl-cdn.alpinelinux.org/alpine|' + baseUrl + '|g" /etc/apk/repositories && ' +
+                                 'sudo sed -i "s|https://dl-cdn.alpinelinux.org/alpine|' + baseUrl + '|g" /etc/apk/repositories';
+              } else {
+                  linuxCommand = '# 基础 URL:\\n' + baseUrl;
+              }
+              
+              document.getElementById('linux-result').textContent = linuxCommand;
+              document.getElementById('linux-result-box').classList.remove('hidden');
+              window.copyToClipboard(linuxCommand).then(() => window.showToast('✅ 已复制换源命令'));
+          }
+          window.copyLinuxCommand = function() { window.copyToClipboard(linuxCommand).then(() => window.showToast('✅ 已复制')); }
+
           window.copyDaemonJson = function() { window.copyToClipboard(daemonJsonStr).then(() => window.showToast('✅ JSON 配置已复制')); }
   
           window.confirmReset = async function() {
@@ -1051,84 +1192,49 @@ function renderDashboard(hostname, password, ip, count, limit, adminIps) {
             try {
               const res = await fetch('/' + window.WORKER_PASSWORD + '/reset');
               const data = await res.json();
-              if (res.ok) {
-                  window.showToast('✅ 额度已重置');
-                  setTimeout(() => location.reload(), 800);
-              } else {
-                  window.showToast('❌ ' + (data.message || '无权操作'), true);
-              }
-            } catch (e) {
-              window.showToast('❌ 网络错误', true);
-            }
+              if (res.ok) { window.showToast('✅ 额度已重置'); setTimeout(() => location.reload(), 800); } 
+              else { window.showToast('❌ ' + (data.message || '无权操作'), true); }
+            } catch (e) { window.showToast('❌ 网络错误', true); }
           }
 
-          // === 新增：确认清空全站 ===
           window.confirmResetAll = async function() {
             if (!confirm('⚠️ 高能预警\\n\\n确定要清空【所有用户】的统计数据吗？\\n此操作不可恢复！')) return;
-            
             try {
               const res = await fetch('/' + window.WORKER_PASSWORD + '/reset-all');
-              if (res.ok) {
-                  window.showToast('✅ 全站数据已清空');
-                  window.viewAllStats();
-                  setTimeout(() => location.reload(), 1000);
-              } else {
-                  window.showToast('❌ 操作失败', true);
-              }
-            } catch (e) {
-              window.showToast('❌ 网络错误', true);
-            }
+              if (res.ok) { window.showToast('✅ 全站数据已清空'); window.viewAllStats(); setTimeout(() => location.reload(), 1000); } 
+              else { window.showToast('❌ 操作失败', true); }
+            } catch (e) { window.showToast('❌ 网络错误', true); }
           }
 
           window.viewAllStats = async function() {
                 const panel = document.getElementById('stats-panel');
                 panel.classList.toggle('hidden');
                 if (panel.classList.contains('hidden')) return;
-
                 try {
                     if (panel.innerHTML.includes('正在加载...')) window.showToast('正在获取全站数据...');
-                    
                     const res = await fetch('/' + window.WORKER_PASSWORD + '/stats');
                     const result = await res.json();
-                    
                     if (res.ok && result.status === "success") {
                         const { totalRequests, uniqueIps, details } = result.data;
                         document.getElementById('stats-summary').textContent = '总请求: ' + totalRequests + ' | 活跃IP: ' + uniqueIps;
-                        
                         const listContainer = document.getElementById('stats-list');
-                        
-                        // 彻底修复: 使用 += 拼接字符串，不再使用任何可能导致 Worker 模板中断的特殊字符
                         let html = '';
                         if (details && details.length > 0) {
                             for (let i = 0; i < details.length; i++) {
                                 const item = details[i];
                                 const isMe = item.ip === window.CURRENT_CLIENT_IP;
                                 const ipClass = isMe ? 'text-blue-500 font-bold' : 'opacity-70';
-                                
                                 html += '<div class="flex justify-between py-1.5 hover:bg-gray-100 dark:hover:bg-slate-700/50 px-2 rounded cursor-default">';
                                 html +=   '<span class="' + ipClass + '">' + item.ip + '</span>';
                                 html +=   '<span class="font-bold">' + item.count + ' 次</span>';
                                 html += '</div>';
                             }
-                        } else {
-                            html = '<div class="text-center py-2 opacity-50">暂无数据</div>';
-                        }
-                        
+                        } else { html = '<div class="text-center py-2 opacity-50">暂无数据</div>'; }
                         listContainer.innerHTML = html;
-                        
-                    } else {
-                        window.showToast('❌ 获取失败: ' + (result.message || '权限不足'), true);
-                    }
-                } catch (e) {
-                    console.error(e);
-                    window.showToast('❌ 网络错误', true);
-                }
+                    } else { window.showToast('❌ 获取失败: ' + (result.message || '权限不足'), true); }
+                } catch (e) { console.error(e); window.showToast('❌ 网络错误', true); }
             }
-
-      } catch(err) {
-          console.error("Dashboard Script Error:", err);
-          alert("Dashboard Script Error: " + err.message);
-      }
+      } catch(err) { console.error("Dashboard Script Error:", err); alert("Dashboard Script Error: " + err.message); }
     </script>
 </body>
 </html>
