@@ -1,13 +1,13 @@
 /**
  * -----------------------------------------------------------------------------------------
- * Cloudflare Worker: 终极 Docker & Linux 代理 (高性能版 v3.3 - 添加 RedHat/Rocky/Alma 支持)
+ * Cloudflare Worker: 终极 Docker & Linux 代理 (高性能版 v3.5 - 增强 GitHub 仓库识别)
  * -----------------------------------------------------------------------------------------
  * 核心功能：
  * 1. Docker Hub/GHCR 等镜像仓库加速下载。
  * 2. 智能处理 Docker 的 library/ 命名空间补全。
  * 3. Linux 软件源加速，新增对 debian-security 的支持。
  * 4. 集成 KV 存储进行每日 IP 请求限额控制。
- * 5. Web Dashboard (修复了交互 Bug，增强了 Linux 换源脚本的兼容性)。
+ * 5. Web Dashboard (修复了交互 Bug，增强了 Linux 换源脚本的兼容性，新增 Git Clone 智能识别)。
  * -----------------------------------------------------------------------------------------
  */
 
@@ -908,7 +908,7 @@ function renderDashboard(hostname, password, ip, count, limit, adminIps) {
                 </button>
                 ${isAdmin ? `
                 <button onclick="viewAllStats()" class="px-3 py-1.5 rounded-lg text-xs font-bold bg-blue-100 text-blue-600 border border-blue-200 hover:bg-blue-200 transition-transform hover:scale-105 flex items-center gap-1.5 shadow-sm">
-                    <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 01-2 2h-2a2 2 0 01-2-2z"></path></svg>
+                    <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"></path></svg>
                     <span>全站统计</span>
                 </button>
                 ` : ''}
@@ -961,7 +961,7 @@ function renderDashboard(hostname, password, ip, count, limit, adminIps) {
                <p id="github-result" class="text-emerald-700 dark:text-emerald-400 font-mono text-xs break-all select-all"></p>
           </div>
           <div class="flex gap-3">
-              <button onclick="copyGithubUrl()" class="flex-1 bg-gray-100 dark:bg-slate-700 hover:bg-gray-200 dark:hover:bg-slate-600 text-gray-700 dark:text-gray-200 py-2.5 rounded-lg text-xs font-bold transition">复制链接</button>
+              <button id="btn-copy-github" onclick="copyGithubUrl()" class="flex-1 bg-gray-100 dark:bg-slate-700 hover:bg-gray-200 dark:hover:bg-slate-600 text-gray-700 dark:text-gray-200 py-2.5 rounded-lg text-xs font-bold transition">复制链接</button>
               <button onclick="openGithubUrl()" class="flex-1 bg-blue-50 dark:bg-blue-900/20 hover:bg-blue-100 dark:hover:bg-blue-900/40 text-blue-600 dark:text-blue-400 py-2.5 rounded-lg text-xs font-bold transition">立即访问</button>
           </div>
         </div>
@@ -1062,6 +1062,7 @@ function renderDashboard(hostname, password, ip, count, limit, adminIps) {
           window.LINUX_MIRRORS = ${linuxMirrorsJson};
           
           let githubAcceleratedUrl = '';
+          let githubOpenUrl = '';
           let dockerCommand = '';
           let linuxCommand = '';
           
@@ -1123,13 +1124,39 @@ function renderDashboard(hostname, password, ip, count, limit, adminIps) {
             let input = document.getElementById('github-url').value.trim();
             if (!input) return window.showToast('❌ 请输入链接', true);
             if (!input.startsWith('http')) { input = 'https://' + input; }
-            githubAcceleratedUrl = window.location.origin + '/' + window.WORKER_PASSWORD + '/' + input;
-            document.getElementById('github-result').textContent = githubAcceleratedUrl;
+            
+            const prefix = window.location.origin + '/' + window.WORKER_PASSWORD + '/';
+            const copyBtn = document.getElementById('btn-copy-github');
+            
+            // 正则匹配 GitHub 仓库链接 (支持带或不带 .git)
+            // 排除 blob/tree/releases 等非仓库根目录链接
+            const repoRegex = /^https?:\\/\\/(?:www\\.)?github\\.com\\/[^/]+\\/[^/]+(?:\\.git)?\\/?$/;
+            
+            if (input.endsWith('.git') || repoRegex.test(input)) {
+                const accUrl = prefix + input;
+                const gitCmd = 'git clone ' + accUrl;
+                
+                document.getElementById('github-result').innerHTML = 
+                    '<span class="block mb-1 font-bold text-indigo-600">终端拉取命令:</span>' + gitCmd + 
+                    '<br><br><span class="block mb-1 font-bold text-indigo-600">加速链接:</span>' + accUrl;
+                
+                githubAcceleratedUrl = gitCmd; // 复制时复制命令
+                githubOpenUrl = accUrl;        // 打开时打开链接
+                copyBtn.textContent = '复制命令';
+                window.showToast('✅ 已识别为仓库');
+            } else {
+                githubAcceleratedUrl = prefix + input;
+                githubOpenUrl = githubAcceleratedUrl;
+                document.getElementById('github-result').textContent = githubAcceleratedUrl;
+                copyBtn.textContent = '复制链接';
+                window.copyToClipboard(githubAcceleratedUrl).then(() => window.showToast('✅ 已复制到剪贴板'));
+            }
+            
             document.getElementById('github-result-box').classList.remove('hidden');
-            window.copyToClipboard(githubAcceleratedUrl).then(() => window.showToast('✅ 已复制到剪贴板'));
           }
+          
           window.copyGithubUrl = function() { window.copyToClipboard(githubAcceleratedUrl).then(() => window.showToast('✅ 已复制')); }
-          window.openGithubUrl = function() { window.open(githubAcceleratedUrl, '_blank'); }
+          window.openGithubUrl = function() { window.open(githubOpenUrl, '_blank'); }
   
           window.convertDockerImage = function() {
             const input = document.getElementById('docker-image').value.trim();
