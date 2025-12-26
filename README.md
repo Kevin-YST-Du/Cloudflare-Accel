@@ -46,23 +46,42 @@
 为了安全和灵活性，建议在 Cloudflare 后台设置配置，而不是修改代码。
 进入 Worker 的 **Settings** -> **Variables**，添加以下变量：
 
-| 变量名 | 说明 | 示例值 |
-| :--- | :--- | :--- |
-| `PASSWORD` | **[必填]** 访问密码 (用于 Web 界面和普通代理) | `123456` |
-| `MAX_REDIRECTS` | 最大重定向次数 (防止死循环) | `5` |
-| `ENABLE_CACHE` | 是否开启 Cloudflare 缓存 (`true`/`false`) | `true` |
-| `CACHE_TTL` | 缓存时间 (秒) | `3600` |
-| `BLACKLIST` | 目标域名黑名单 (禁止代理访问的域名) | `baidu.com, qq.com` |
-| `WHITELIST` | 目标域名白名单 (只允许代理访问的域名) | `github.com, raw.githubusercontent.com` |
-| `ALLOW_IPS` | 允许访问的客户端 IP (逗号分隔，留空不限制) | `1.2.3.4, 223.5.5.5` |
-| `ALLOW_COUNTRIES` | 允许访问的国家代码 (逗号分隔，留空不限制) | `CN, US, HK` |
-| `DAILY_LIMIT_COUNT` | 额度限制 (KV)每个 IP 每日最大请求次数 | `200` |
-| `ADMIN_IPS` | 管理员 IP (拥有重置额度、查看统计、清空全站数据的权限)| `127.0.0.1` |
-| `IP_LIMIT_WHITELIST` | 免额度 IP 白名单 (请求不计入每日限额)| `127.0.0.1` |
+| 变量名 | 说明 | 示例值 | 必填 |
+| :--- | :--- | :--- | :--- |
+| `PASSWORD` |  访问密码 (用于 Web 界面和普通代理) | `123456` | 推荐 |
+| `MAX_REDIRECTS` | 最大重定向次数 (防止死循环) | `5` | 否 |
+| `ENABLE_CACHE` | 是否开启 Cloudflare 缓存 (`true`/`false`) | `true` | 否 |
+| `CACHE_TTL` | 缓存时间 (秒) | `3600` | 否 |
+| `BLACKLIST` | 目标域名黑名单 (禁止代理访问的域名) | `baidu.com, qq.com` | 否 |
+| `WHITELIST` | 目标域名白名单 (只允许代理访问的域名) | `github.com, raw.githubusercontent.com` | 否 |
+| `ALLOW_IPS` | 允许访问的客户端 IP (逗号分隔，留空不限制) | `1.2.3.4, 223.5.5.5` | 否 |
+| `ALLOW_COUNTRIES` | 允许访问的国家代码 (逗号分隔，留空不限制) | `CN, US, HK` | 否 |
+| `DAILY_LIMIT_COUNT` | 额度限制 (KV)每个 IP 每日最大请求次数 | `200` | 否 |
+| `ADMIN_IPS` | 管理员 IP (拥有重置额度、查看统计、清空全站数据的权限)| `127.0.0.1` | 否 |
+| `IP_LIMIT_WHITELIST` | 免额度 IP 白名单 (请求不计入每日限额)| `127.0.0.1` | 否 |
 
 
+📦 重点：KV 命名空间绑定
+# 1. 为什么要绑定 KV？
+## 持久化存储：如果不绑定 KV，所有的计数（IP 请求数）都存在内存中。Worker 闲置或重启后，计数会清零，导致限额功能失效。
+## 全站统计：绑定 KV 后，管理员可以跨 session 查看今天所有 IP 的访问记录和总请求量。
+## 防爆破：持久化的限额可以更有效地保护你的 Cloudflare 额度（防止被他人恶意刷流量）。
 
-*(注：如果未设置环境变量，代码将使用文件顶部的 `DEFAULT_CONFIG` 默认值)*
+# 2. 绑定步骤 (详细操作)
+## 在 Cloudflare 侧边栏点击 Storage & Databases -> KV。
+## 点击 Create namespace，名字可以自定义（例如：ACCEL_STORAGE）。
+## 回到你的 Worker 详情页。
+## 点击 Settings 选项卡 -> Variables 页面。
+## 滚动到 KV Namespace Bindings 部分，点击 Add binding。
+## Variable name 必须填：IP_LIMIT_KV (注意全大写)。
+## KV namespace 选择你刚才创建的那个空间（如 ACCEL_STORAGE）。
+## 点击 Save and deploy。
+
+# 3. 如果不绑定 KV 会怎样？
+## 程序依然可以运行，但限额功能将变得不可靠。
+## 每次 Worker “冷启动”（一段时间没访问后再访问）时，之前的计数都会消失。
+## Web 面板中的“全站统计”将无法获取历史数据，只能看到当前瞬间的内存状态。
+## *(注：如果未设置环境变量，代码将使用文件顶部的 `DEFAULT_CONFIG` 默认值)*
 
 ## 另外的文件为混淆版本
 ---
@@ -103,6 +122,24 @@ docker pull [docker.example.com/gcr.io/google-samples/hello-app:1.0](https://doc
 ### 2.检查你的 IP/国家是否在允许列表中。
 
 ### 3.如果是 Docker 拉取，脚本已自动处理 S3 签名问题，请确保你的 Worker 域名没有被墙。
+
+## Q: 为什么我修改了 PASSWORD 环境变量，但访问还是旧密码？
+### A: 修改环境变量后，必须点击页面底部的 Save and deploy，Cloudflare 需要约 30 秒同步到全球节点。
+
+## Q: 我该如何查看自己的 IP 是否在管理员列表中？
+### A: 访问 Web 面板（https://域名/密码），顶部会显示你的当前 IP。将该 IP 复制并填入 ADMIN_IPS 变量中即可生效。
+
+## Q: Docker 拉取镜像提示 429 错误？
+### A: 这表示该 IP 已达到 DAILY_LIMIT_COUNT 设定的上限。你可以作为管理员进入后台点击“重置额度”，或者增加变量的值。
+
+## Q: 换源脚本报错 "Permission denied"？
+### A: 脚本中包含 sudo 命令，请确保你的 Linux 用户具有 sudo 权限，或者直接以 root 用户运行。
+
+## Q: 是否支持自定义域名？
+### A: 非常建议使用自定义域名。在 Worker 的 Settings -> Domains & Routes 中添加你的域名。使用自定义域名可以避免某些地区对 *.workers.dev 的干扰。
+
+## 📄 法律说明
+### 本项目仅供网络技术研究和学习使用。在使用过程中，请遵守所在地及 Cloudflare 的服务条款。
 
 # 许可证
 ## 本项目基于 MIT 许可证开源。
