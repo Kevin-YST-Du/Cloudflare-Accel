@@ -49,11 +49,18 @@
 | 变量名 | 说明 | 示例值 |
 | :--- | :--- | :--- |
 | `PASSWORD` | **[必填]** 访问密码 (用于 Web 界面和普通代理) | `123456` |
-| `ALLOW_IPS` | 允许访问的客户端 IP (逗号分隔，留空不限制) | `1.2.3.4, 223.5.5.5` |
-| `ALLOW_COUNTRIES` | 允许访问的国家代码 (逗号分隔，留空不限制) | `CN, US, HK` |
+| `MAX_REDIRECTS` | 最大重定向次数 (防止死循环) | `5` |
+| `ENABLE_CACHE` | 是否开启 Cloudflare 缓存 (`true`/`false`) | `true` |
+| `CACHE_TTL` | 缓存时间 (秒) | `3600` |
 | `BLACKLIST` | 目标域名黑名单 (禁止代理访问的域名) | `baidu.com, qq.com` |
 | `WHITELIST` | 目标域名白名单 (只允许代理访问的域名) | `github.com, raw.githubusercontent.com` |
-| `ENABLE_CACHE` | 是否开启 Cloudflare 缓存 (`true`/`false`) | `true` |
+| `ALLOW_IPS` | 允许访问的客户端 IP (逗号分隔，留空不限制) | `1.2.3.4, 223.5.5.5` |
+| `ALLOW_COUNTRIES` | 允许访问的国家代码 (逗号分隔，留空不限制) | `CN, US, HK` |
+| `DAILY_LIMIT_COUNT` | 额度限制 (KV)每个 IP 每日最大请求次数 | `200` |
+| `ADMIN_IPS` | 管理员 IP (拥有重置额度、查看统计、清空全站数据的权限)| `127.0.0.1` |
+| `IP_LIMIT_WHITELIST` | 免额度 IP 白名单 (请求不计入每日限额)| `127.0.0.1` |
+
+
 
 *(注：如果未设置环境变量，代码将使用文件顶部的 `DEFAULT_CONFIG` 默认值)*
 
