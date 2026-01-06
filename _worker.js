@@ -1,14 +1,14 @@
 /**
  * -----------------------------------------------------------------------------------------
- * Cloudflare Worker: 终极 Docker & Linux 代理 (v4.2 - 全注释详解版)
+ * Cloudflare Worker: 终极 Docker & Linux 代理 (v4.3 - 递归缓存增强版)
  * -----------------------------------------------------------------------------------------
  * 核心功能：
  * 1. Docker Hub/GHCR 等镜像仓库加速下载。
  * 2. 智能处理 Docker 的 library/ 命名空间补全。
  * 3. Linux 软件源加速，支持 debian-security 及 Range 断点续传。
  * 4. 双模式通用代理 (Raw / Recursive)。
- * 5. 递归模式强制文本处理，修复压缩乱码问题。
- * 6. Dashboard: 递归加速模块样式与 GitHub 模块完全统一，且代码包含详细注释。
+ * 5. [增强] 递归模式集成 Cache API，极大提升脚本二次访问速度。
+ * 6. Dashboard: 递归加速模块样式与 GitHub 文件加速模块完全一致。
  * -----------------------------------------------------------------------------------------
  */
 
@@ -20,8 +20,8 @@ const DEFAULT_CONFIG = {
     // --- 基础配置 ---
     PASSWORD: "123456",               // 访问密码 (用于 Web 界面登录和通用代理的路径验证)
     MAX_REDIRECTS: 5,                 // 代理请求时允许的最大重定向次数 (防止死循环)
-    ENABLE_CACHE: true,               // 是否开启 Worker 级缓存 (减少回源请求)
-    CACHE_TTL: 3600,                  // 缓存存活时间 (单位: 秒)
+    ENABLE_CACHE: true,               // 是否开启 Worker 级缓存 (减少回源请求，重点优化递归模式)
+    CACHE_TTL: 3600,                  // 缓存存活时间 (单位: 秒，默认1小时)
     
     // --- 访问控制 (安全设置) ---
     BLACKLIST: "",                    // 域名黑名单 (逗号分隔，禁止代理这些域名的内容)
@@ -243,8 +243,8 @@ export default {
                     const upstreamBase = LINUX_MIRRORS[linuxDistro];
                     response = await handleLinuxMirrorRequest(request, upstreamBase, realPath);
                 } else {
-                    // 进入通用文件代理逻辑 (传入模式参数)
-                    response = await handleGeneralProxy(request, targetUrlPart + (url.search || ""), CONFIG, proxyMode);
+                    // 进入通用文件代理逻辑 (传入模式参数和 ctx 用于缓存)
+                    response = await handleGeneralProxy(request, targetUrlPart + (url.search || ""), CONFIG, proxyMode, ctx);
                 }
             }
 
@@ -526,11 +526,26 @@ async function handleLinuxMirrorRequest(request, upstreamBase, path) {
 // ==============================================================================
 // 3.6 通用代理逻辑 (核心: Raw vs Recursive)
 // ==============================================================================
-async function handleGeneralProxy(request, targetUrlStr, CONFIG, mode = 'raw') {
+async function handleGeneralProxy(request, targetUrlStr, CONFIG, mode = 'raw', ctx) {
     let currentUrlStr = targetUrlStr;
     // 容错：如果用户没写协议头，补全 https://
     if (!currentUrlStr.startsWith("http")) {
         currentUrlStr = 'https://' + currentUrlStr.replace(/^(https?):\/+/, '$1://');
+    }
+
+    // --- 缓存检查 (仅针对递归模式) ---
+    // 递归模式涉及正则替换，消耗 CPU，且结果是纯文本，非常适合缓存。
+    // 使用 request.url 作为缓存键。
+    const cache = caches.default;
+    const cacheKey = request.url; 
+    
+    if (mode === 'recursive' && CONFIG.ENABLE_CACHE) {
+        // 尝试从缓存中获取响应
+        const cachedResponse = await cache.match(cacheKey);
+        if (cachedResponse) {
+            // 命中缓存，直接返回 (Response 需要 clone 吗？match 返回的通常可以直接用)
+            return cachedResponse;
+        }
     }
 
     let finalResponse = null;
@@ -538,6 +553,7 @@ async function handleGeneralProxy(request, targetUrlStr, CONFIG, mode = 'raw') {
 
     try {
         // --- 1. 手动处理重定向循环 ---
+        // 我们手动跟踪重定向，而不是让 fetch 自动处理，是为了更好地控制 Header 和流程
         let redirectCount = 0;
         while (redirectCount < CONFIG.MAX_REDIRECTS) {
             let currentTargetUrl;
@@ -554,18 +570,20 @@ async function handleGeneralProxy(request, targetUrlStr, CONFIG, mode = 'raw') {
             newHeaders.set("Referer", currentTargetUrl.origin + "/"); 
             newHeaders.set("Origin", currentTargetUrl.origin);
             
-            // 伪装 User-Agent
+            // 伪装 User-Agent (许多脚本服务器会拒绝无 UA 的请求或 curl)
             if (!newHeaders.get("User-Agent")) {
                 newHeaders.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
             }
             
+            // 传递 Range 头 (Raw 模式下下载大文件需要)
             const range = request.headers.get('Range');
             if (range) newHeaders.set('Range', range);
 
-            // 清理 Cloudflare 头
+            // 清理 Cloudflare 自身产生的头，避免循环或被上游识别
             newHeaders.delete("Cf-Worker"); newHeaders.delete("Cf-Ray"); newHeaders.delete("Cookie"); newHeaders.delete("X-Forwarded-For");
             newHeaders.delete("Cf-Connecting-Ip");
 
+            // 发起请求 (redirect: manual)
             const response = await fetch(currentUrlStr, {
                 method: request.method, headers: newHeaders, body: request.body, redirect: "manual"
             });
@@ -587,17 +605,19 @@ async function handleGeneralProxy(request, targetUrlStr, CONFIG, mode = 'raw') {
 
         // --- 2. 构造响应头 ---
         const responseHeaders = new Headers(finalResponse.headers);
+        // 清理安全策略头，允许我们在 Dashboard 中嵌入 (如果有需要) 或跨域使用
         responseHeaders.delete("Content-Security-Policy"); 
         responseHeaders.delete("Content-Security-Policy-Report-Only");
         responseHeaders.delete("Clear-Site-Data");
         responseHeaders.set("Access-Control-Allow-Origin", "*");
         
+        // 调试头：标识当前的代理模式
         responseHeaders.set("X-Proxy-Mode", mode === 'recursive' ? "Recursive-Force-Text" : "Raw-Passthrough");
 
         // ==========================================
         // 模式 A: Raw (纯净模式)
         // ==========================================
-        // 直接透传流，不修改内容，保持二进制完整性
+        // 直接透传流，不修改内容，保持二进制完整性，适合 zip/iso/exe
         if (mode === 'raw') {
             return new Response(finalResponse.body, { status: finalResponse.status, headers: responseHeaders });
         }
@@ -611,9 +631,9 @@ async function handleGeneralProxy(request, targetUrlStr, CONFIG, mode = 'raw') {
             // 如果上游返回了 Content-Encoding: gzip，Cloudflare 会自动解压
             // 如果我们不删除这个头，客户端会以为body还是压缩的，导致报错或乱码
             responseHeaders.delete("Content-Encoding");
-            responseHeaders.delete("Content-Length");
+            responseHeaders.delete("Content-Length"); // 内容长度会变，必须删掉让浏览器重新计算
             responseHeaders.delete("Transfer-Encoding");
-            responseHeaders.delete("Content-Disposition"); 
+            responseHeaders.delete("Content-Disposition"); // 防止强制下载
 
             // 强制读取文本 (Cloudflare 会自动解压 gzip)
             let text = await finalResponse.text();
@@ -622,17 +642,30 @@ async function handleGeneralProxy(request, targetUrlStr, CONFIG, mode = 'raw') {
             const proxyBase = `${workerOrigin}/${CONFIG.PASSWORD}/r/`; 
 
             // 全局正则替换：匹配所有 http:// 或 https:// 开头的链接
+            // 这是一个比较宽泛的正则，能匹配到大多数 URL
             const regex = /(https?:\/\/[a-zA-Z0-9][-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b([-a-zA-Z0-9()@:%_\+.~#?&//=]*))/g;
             
             text = text.replace(regex, (match) => {
-                // 如果链接已经是本站域名的，则不替换，防止多重嵌套
+                // 如果链接已经是本站域名的，则不替换，防止多重嵌套 (proxy of proxy)
                 if (match.includes(workerOrigin)) return match;
                 // 添加 /r/ 前缀，实现递归代理
                 return proxyBase + match;
             });
 
-            // 返回修改后的文本
-            return new Response(text, { status: finalResponse.status, headers: responseHeaders });
+            // 构造新的响应对象
+            const modifiedResponse = new Response(text, { status: finalResponse.status, headers: responseHeaders });
+
+            // --- 写入缓存 (仅在开启且处理成功时) ---
+            if (CONFIG.ENABLE_CACHE && finalResponse.status === 200) {
+                // 克隆响应，因为 body 只能被读取一次
+                const responseToCache = modifiedResponse.clone();
+                // 必须设置 Cache-Control 头，否则 Cloudflare Cache API 不会存储
+                responseToCache.headers.set("Cache-Control", `public, max-age=${CONFIG.CACHE_TTL}`);
+                // 异步写入缓存
+                ctx.waitUntil(cache.put(cacheKey, responseToCache));
+            }
+
+            return modifiedResponse;
         }
 
     } catch (e) { return new Response(`Proxy Error: ${e.message}`, { status: 502 }); }
